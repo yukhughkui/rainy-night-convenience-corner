@@ -1,0 +1,2286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>雨夜便利店 · 街角微缩模型</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #04060b;
+    -webkit-user-select: none; user-select: none;
+  }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  #app canvas:active { cursor: grabbing; }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 2;
+    background: radial-gradient(ellipse at 50% 45%, rgba(0,0,0,0) 42%, rgba(0,0,0,.28) 76%, rgba(0,0,0,.6) 100%);
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="vignette"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ============================================================
+   基础
+   ============================================================ */
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x0a1220, 0.0125);
+
+const camera = new THREE.PerspectiveCamera(41, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(9.8, 8.9, 14.3);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(-3.8, 1.9, -3.9);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.rotateSpeed = 0.62;
+controls.zoomSpeed = 0.8;
+controls.enablePan = false;
+controls.minDistance = 9;
+controls.maxDistance = 42;
+controls.minPolarAngle = 0.16;
+controls.maxPolarAngle = 1.47;
+controls.update();
+
+const clock = new THREE.Clock();
+const updaters = [];
+const onUpdate = (fn) => updaters.push(fn);
+
+/* 三渲二渐变 */
+const gradientMap = new THREE.DataTexture(new Uint8Array([42, 118, 196, 255]), 4, 1, THREE.RedFormat);
+gradientMap.minFilter = gradientMap.magFilter = THREE.NearestFilter;
+gradientMap.needsUpdate = true;
+
+const outlineMat = new THREE.MeshBasicMaterial({ color: 0x080b13, side: THREE.BackSide });
+const world = new THREE.Group();
+scene.add(world);
+
+/* ============================================================
+   工具
+   ============================================================ */
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = (arr) => arr[(Math.random() * arr.length) | 0];
+const TAU = Math.PI * 2;
+
+function makeCanvas(w, h, draw) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  return c;
+}
+
+function canvasTex(w, h, draw, opts = {}) {
+  const tex = new THREE.CanvasTexture(makeCanvas(w, h, draw));
+  tex.colorSpace = opts.linear ? THREE.NoColorSpace : THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  if (opts.repeat) {
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(opts.repeat[0], opts.repeat[1]);
+  }
+  return tex;
+}
+
+function repeatTex(tex, x, y) {
+  const t = tex.clone();
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(x, y);
+  t.needsUpdate = true;
+  return t;
+}
+
+function toon(color, opts = {}) {
+  return new THREE.MeshToonMaterial({ color, gradientMap, ...opts });
+}
+function basic(color, opts = {}) {
+  return new THREE.MeshBasicMaterial({ color, ...opts });
+}
+function std(color, opts = {}) {
+  return new THREE.MeshStandardMaterial({ color, envMapIntensity: 0.8, ...opts });
+}
+
+function addOutline(mesh, scale = 1.03) {
+  const o = new THREE.Mesh(mesh.geometry, outlineMat);
+  o.scale.setScalar(scale);
+  o.castShadow = false;
+  o.receiveShadow = false;
+  mesh.add(o);
+  return mesh;
+}
+
+function box(w, h, d, mat, x, y, z, opts = {}) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  m.castShadow = opts.cast !== false;
+  m.receiveShadow = opts.receive !== false;
+  if (opts.rx) m.rotation.x = opts.rx;
+  if (opts.ry) m.rotation.y = opts.ry;
+  if (opts.rz) m.rotation.z = opts.rz;
+  (opts.parent || world).add(m);
+  if (opts.outline) addOutline(m, opts.outline);
+  return m;
+}
+
+function cyl(rt, rb, h, seg, mat, x, y, z, opts = {}) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg), mat);
+  m.position.set(x, y, z);
+  m.castShadow = opts.cast !== false;
+  m.receiveShadow = opts.receive !== false;
+  if (opts.rx) m.rotation.x = opts.rx;
+  if (opts.ry) m.rotation.y = opts.ry;
+  if (opts.rz) m.rotation.z = opts.rz;
+  (opts.parent || world).add(m);
+  if (opts.outline) addOutline(m, opts.outline);
+  return m;
+}
+
+function plane(w, h, mat, x, y, z, opts = {}) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  m.position.set(x, y, z);
+  m.rotation.x = opts.rx !== undefined ? opts.rx : 0;
+  m.rotation.y = opts.ry || 0;
+  m.rotation.z = opts.rz || 0;
+  m.castShadow = false;
+  m.receiveShadow = opts.receive || false;
+  (opts.parent || world).add(m);
+  return m;
+}
+
+function tube(a, b, r, mat, parent = world, radial = 6) {
+  const dir = new THREE.Vector3().subVectors(b, a);
+  const len = dir.length();
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, radial), mat);
+  m.position.copy(a).add(b).multiplyScalar(0.5);
+  m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+  m.castShadow = true;
+  m.receiveShadow = true;
+  parent.add(m);
+  return m;
+}
+
+/* 光晕贴图 */
+const glowTexture = canvasTex(128, 128, (ctx) => {
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.18, 'rgba(255,255,255,.72)');
+  g.addColorStop(0.46, 'rgba(255,255,255,.18)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 128, 128);
+});
+function glow(color, size, opacity = 0.5, parent = world) {
+  const mat = new THREE.SpriteMaterial({
+    map: glowTexture, color, transparent: true, opacity,
+    blending: THREE.AdditiveBlending, depthWrite: false
+  });
+  const s = new THREE.Sprite(mat);
+  s.scale.set(size, size, 1);
+  parent.add(s);
+  return s;
+}
+
+/* ============================================================
+   背景 / 环境反射
+   ============================================================ */
+scene.background = canvasTex(1024, 1024, (ctx, w, h) => {
+  ctx.fillStyle = '#03050a';
+  ctx.fillRect(0, 0, w, h);
+  let g = ctx.createRadialGradient(w * .48, h * .42, 40, w * .48, h * .42, w * .78);
+  g.addColorStop(0, '#1d3050');
+  g.addColorStop(0.36, '#0d1930');
+  g.addColorStop(0.72, '#050a13');
+  g.addColorStop(1, '#02040a');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  g = ctx.createRadialGradient(w * .74, h * .62, 20, w * .74, h * .62, w * .4);
+  g.addColorStop(0, 'rgba(36,78,116,.26)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+});
+
+const envTex = canvasTex(1024, 512, (ctx, w, h) => {
+  let g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, '#050a12');
+  g.addColorStop(0.42, '#0d1a2c');
+  g.addColorStop(0.54, '#1a2b40');
+  g.addColorStop(0.72, '#060b14');
+  g.addColorStop(1, '#02040a');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.filter = 'blur(26px)';
+  const blob = (x, y, rx, ry, color) => {
+    const rg = ctx.createRadialGradient(x, y, 0, x, y, Math.max(rx, ry));
+    rg.addColorStop(0, color);
+    rg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(1, ry / rx);
+    ctx.translate(-x, -y);
+    ctx.fillStyle = rg;
+    ctx.beginPath();
+    ctx.arc(x, y, rx, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  };
+  blob(w * 0.16, h * 0.6, 90, 46, 'rgba(255,190,112,.95)');
+  blob(w * 0.31, h * 0.55, 54, 26, 'rgba(120,200,255,.8)');
+  blob(w * 0.49, h * 0.62, 70, 34, 'rgba(255,240,208,.9)');
+  blob(w * 0.61, h * 0.57, 40, 20, 'rgba(255,120,86,.7)');
+  blob(w * 0.78, h * 0.6, 66, 28, 'rgba(96,168,255,.55)');
+  blob(w * 0.9, h * 0.58, 34, 16, 'rgba(255,160,90,.6)');
+  blob(w * 0.08, h * 0.4, 26, 80, 'rgba(90,140,210,.22)');
+  ctx.filter = 'none';
+});
+envTex.mapping = THREE.EquirectangularReflectionMapping;
+scene.environment = envTex;
+
+/* ============================================================
+   主体纹理
+   ============================================================ */
+const asphaltTex = canvasTex(512, 512, (ctx, w, h) => {
+  ctx.fillStyle = '#222a36';
+  ctx.fillRect(0, 0, w, h);
+  for (let i = 0; i < 6000; i++) {
+    const v = Math.random();
+    ctx.fillStyle = v > .72 ? 'rgba(84,96,114,.22)' : (v > .34 ? 'rgba(20,26,36,.26)' : 'rgba(150,160,172,.055)');
+    const s = Math.random() * 2.2 + 0.5;
+    ctx.fillRect(Math.random() * w, Math.random() * h, s, s);
+  }
+  ctx.strokeStyle = 'rgba(12,16,24,.4)';
+  ctx.lineWidth = 1.4;
+  for (let i = 0; i < 8; i++) {
+    ctx.beginPath();
+    let x = Math.random() * w, y = Math.random() * h;
+    ctx.moveTo(x, y);
+    for (let j = 0; j < 5; j++) { x += rand(-38, 38); y += rand(-38, 38); ctx.lineTo(x, y); }
+    ctx.stroke();
+  }
+}, { repeat: [3, 3] });
+
+const asphaltRoughTex = canvasTex(512, 512, (ctx, w, h) => {
+  ctx.fillStyle = '#a8a8a8';
+  ctx.fillRect(0, 0, w, h);
+  ctx.filter = 'blur(18px)';
+  for (let i = 0; i < 26; i++) {
+    const v = Math.random() > .5 ? 'rgba(48,48,48,.85)' : 'rgba(210,210,210,.5)';
+    ctx.fillStyle = v;
+    ctx.beginPath();
+    ctx.ellipse(Math.random() * w, Math.random() * h, rand(24, 90), rand(12, 46), rand(0, TAU), 0, TAU);
+    ctx.fill();
+  }
+  ctx.filter = 'none';
+}, { repeat: [3, 3], linear: true });
+
+const concreteTex = canvasTex(512, 512, (ctx, w, h) => {
+  ctx.fillStyle = '#626b78';
+  ctx.fillRect(0, 0, w, h);
+  for (let i = 0; i < 4200; i++) {
+    ctx.fillStyle = Math.random() > .5 ? 'rgba(180,188,198,.10)' : 'rgba(30,36,46,.12)';
+    ctx.fillRect(Math.random() * w, Math.random() * h, 1.6, 1.6);
+  }
+  ctx.strokeStyle = 'rgba(28,34,44,.62)';
+  ctx.lineWidth = 3;
+  for (let x = 0; x <= w; x += 128) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let y = 0; y <= h; y += 128) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(190,198,206,.08)';
+  ctx.lineWidth = 1;
+  for (let x = 2; x <= w; x += 128) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let y = 2; y <= h; y += 128) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+}, { repeat: [4, 4] });
+
+const tileFloorTex = canvasTex(512, 512, (ctx, w, h) => {
+  ctx.fillStyle = '#d8d0c0';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#b9ad99';
+  ctx.lineWidth = 4;
+  for (let x = 0; x <= w; x += 128) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let y = 0; y <= h; y += 128) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  for (let i = 0; i < 1200; i++) {
+    ctx.fillStyle = 'rgba(255,255,255,.05)';
+    ctx.fillRect(Math.random() * w, Math.random() * h, 2, 2);
+  }
+}, { repeat: [3.2, 3.2] });
+
+/* 便利店招牌 */
+const storeSignTex = canvasTex(1024, 224, (ctx, w, h) => {
+  const g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, '#fffdf4');
+  g.addColorStop(0.7, '#f4f1e4');
+  g.addColorStop(1, '#e8e5d8');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+
+  // 星形标志
+  const star = (cx, cy, outer, inner, points, fill) => {
+    ctx.beginPath();
+    for (let i = 0; i < points * 2; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / points;
+      const r = i % 2 === 0 ? outer : inner;
+      ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    }
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+  };
+  ctx.save();
+  ctx.translate(102, 102);
+  ctx.rotate(-0.08);
+  star(0, 0, 52, 21, 5, '#2d6fbe');
+  star(14, -8, 24, 10, 5, '#f6b04e');
+  ctx.restore();
+
+  ctx.fillStyle = '#17325f';
+  ctx.font = '900 90px "Arial Black", Arial, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('HOSHI MART', 186, 102);
+
+  ctx.fillStyle = '#5b6b80';
+  ctx.font = '700 24px Arial, sans-serif';
+  ctx.fillText('OPEN 24 HOURS   ·   COFFEE   ·   HOT SNACKS', 190, 162);
+
+  const stripes = ['#2b6fd6', '#2fb37d', '#f0a044'];
+  stripes.forEach((c, i) => {
+    ctx.fillStyle = c;
+    ctx.fillRect(0, 192 + i * 11, w, 7);
+  });
+});
+
+const projSignTex = canvasTex(256, 640, (ctx, w, h) => {
+  const g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, '#fffdf5');
+  g.addColorStop(1, '#eeeadb');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#d5d0c2';
+  ctx.lineWidth = 8;
+  ctx.strokeRect(4, 4, w - 8, h - 8);
+
+  ctx.save();
+  ctx.translate(128, 104);
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5;
+    const r = i % 2 === 0 ? 58 : 23;
+    ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#2d6fbe';
+  ctx.fill();
+  ctx.restore();
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#17325f';
+  ctx.font = '900 118px "Arial Black", Arial, sans-serif';
+  ctx.fillText('24H', 128, 280);
+  ctx.font = '900 62px Arial, sans-serif';
+  ctx.fillText('HOSHI', 128, 380);
+  ctx.fillText('MART', 128, 448);
+  ctx.fillStyle = '#5b6b80';
+  ctx.font = '700 22px Arial, sans-serif';
+  ctx.fillText('COFFEE · SNACKS', 128, 512);
+
+  ['#2b6fd6', '#2fb37d', '#f0a044'].forEach((c, i) => {
+    ctx.fillStyle = c;
+    ctx.fillRect(0, h - 56 + i * 14, w, 9);
+  });
+});
+
+const labelTex = (text, bg = '#f4efdf', fg = '#20314f', sub = '') => canvasTex(512, 160, (ctx, w, h) => {
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = 'rgba(35,52,78,.16)';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(5, 5, w - 10, h - 10);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = fg;
+  ctx.font = '900 74px Arial, sans-serif';
+  ctx.fillText(text, w / 2, sub ? 66 : h / 2);
+  if (sub) {
+    ctx.font = '700 26px Arial, sans-serif';
+    ctx.fillStyle = '#7c8798';
+    ctx.fillText(sub, w / 2, 120);
+  }
+});
+
+const coffeeDecalTex = canvasTex(320, 400, (ctx, w, h) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = 'rgba(250,246,231,.96)';
+  ctx.beginPath();
+  ctx.roundRect(8, 8, w - 16, h - 16, 22);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(60,72,80,.15)';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.fillStyle = '#3c2b1f';
+  ctx.beginPath();
+  ctx.roundRect(76, 78, 138, 118, 12);
+  ctx.fill();
+  ctx.strokeStyle = '#3c2b1f';
+  ctx.lineWidth = 14;
+  ctx.beginPath();
+  ctx.arc(224, 130, 36, -1.2, 1.2);
+  ctx.stroke();
+  ctx.fillStyle = '#f2e6d2';
+  ctx.fillRect(94, 96, 102, 14);
+  ctx.fillStyle = '#d99247';
+  ctx.beginPath();
+  ctx.roundRect(76, 188, 138, 10, 4);
+  ctx.fill();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#5a3c28';
+  ctx.font = '900 44px Arial, sans-serif';
+  ctx.fillText('HOT', w / 2, 262);
+  ctx.fillText('COFFEE', w / 2, 308);
+  ctx.fillStyle = '#9a6c4b';
+  ctx.font = '700 24px Arial, sans-serif';
+  ctx.fillText('FRESH & WARM', w / 2, 348);
+});
+
+/* ============================================================
+   灯光
+   ============================================================ */
+scene.add(new THREE.HemisphereLight(0x6f8dbb, 0x0b0f18, 0.72));
+
+const moon = new THREE.DirectionalLight(0xa9c4ef, 1.35);
+moon.position.set(10.5, 17, 8);
+moon.castShadow = true;
+moon.shadow.mapSize.set(2048, 2048);
+moon.shadow.camera.left = -14;
+moon.shadow.camera.right = 14;
+moon.shadow.camera.top = 14;
+moon.shadow.camera.bottom = -14;
+moon.shadow.camera.near = 1;
+moon.shadow.camera.far = 48;
+moon.shadow.bias = -0.0006;
+moon.shadow.normalBias = 0.025;
+moon.shadow.radius = 1;
+scene.add(moon);
+
+const rim = new THREE.DirectionalLight(0x4d6ea8, 0.42);
+rim.position.set(-9, 8, -12);
+scene.add(rim);
+
+const fillLight = new THREE.DirectionalLight(0x6e93c9, 0.32);
+fillLight.position.set(9, 6, 14);
+scene.add(fillLight);
+
+/* ============================================================
+   底座 / 路面 / 人行道
+   ============================================================ */
+const baseMat = toon(0x161b26);
+const baseTrimMat = toon(0x252b38);
+box(18.7, 0.5, 18.7, baseMat, 0, -0.95, 0, { cast: true, receive: true, outline: 1.004 });
+box(18.2, 0.7, 18.2, baseTrimMat, 0, -0.35, 0, { cast: true, receive: true, outline: 1.003 });
+
+const plaqueTex = canvasTex(1024, 160, (ctx, w, h) => {
+  const g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, '#3b3428');
+  g.addColorStop(0.45, '#6d5e42');
+  g.addColorStop(1, '#2a261e');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = 'rgba(236,214,164,.5)';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(18, 18, w - 36, h - 36);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e8d6ae';
+  ctx.font = '700 46px Georgia, serif';
+  ctx.fillText('H O S H I  M A R T', w / 2, 74);
+  ctx.fillStyle = 'rgba(232,214,174,.7)';
+  ctx.font = '500 22px Georgia, serif';
+  ctx.fillText('1 / 64   ·   RAINY NIGHT   ·   HOSHIMI CITY', w / 2, 116);
+});
+plane(3.2, 0.42, basic(0xffffff, { map: plaqueTex }), 0, -0.95, 9.361, { ry: Math.PI });
+
+const asphaltMat = new THREE.MeshStandardMaterial({
+  map: asphaltTex,
+  roughnessMap: asphaltRoughTex,
+  roughness: 0.5,
+  metalness: 0.42,
+  envMapIntensity: 1.15
+});
+const ground = plane(17.98, 17.98, asphaltMat, 0, 0.005, 0, { rx: -Math.PI / 2, receive: true });
+
+/* 人行道（店主块） */
+const sidewalkMat = new THREE.MeshStandardMaterial({
+  map: repeatTex(concreteTex, 4.6, 4.0),
+  roughness: 0.42,
+  metalness: 0.22,
+  envMapIntensity: 0.85
+});
+box(9.9, 0.16, 8.5, sidewalkMat, -4.05, 0.08, -4.75, { cast: false, receive: true });
+/* 转角石 */
+const curbMat = std(0x8b93a0, { roughness: 0.38, metalness: 0.25 });
+box(9.94, 0.05, 0.16, curbMat, -4.05, 0.168, -0.54, { cast: false });
+box(0.16, 0.05, 8.44, curbMat, 0.87, 0.168, -4.75, { cast: false });
+
+/* 远侧人行道 */
+const farWalkS = new THREE.MeshStandardMaterial({
+  map: repeatTex(concreteTex, 8.4, 2.1),
+  roughness: 0.44, metalness: 0.2, envMapIntensity: 0.8
+});
+box(18, 0.16, 3.6, farWalkS, 0, 0.08, 7.2, { cast: false, receive: true });
+box(3.6, 0.16, 5.4, new THREE.MeshStandardMaterial({
+  map: repeatTex(concreteTex, 2.1, 3.2),
+  roughness: 0.44, metalness: 0.2, envMapIntensity: 0.8
+}), 7.2, 0.08, 3.1, { cast: false, receive: true });
+box(18.04, 0.05, 0.14, curbMat, 0, 0.168, 5.36, { cast: false });
+box(0.14, 0.05, 5.5, curbMat, 5.36, 0.168, 2.6, { cast: false });
+
+/* 盲道 */
+const tactileTex = canvasTex(128, 64, (ctx, w, h) => {
+  ctx.fillStyle = '#b79a54';
+  ctx.fillRect(0, 0, w, h);
+  for (let y = 10; y < h; y += 22) {
+    for (let x = 10; x < w; x += 22) {
+      ctx.fillStyle = '#d8bb6c';
+      ctx.beginPath(); ctx.arc(x, y, 6, 0, TAU); ctx.fill();
+      ctx.fillStyle = 'rgba(86,72,38,.32)';
+      ctx.beginPath(); ctx.arc(x + 2, y + 2, 5, 0, TAU); ctx.fill();
+    }
+  }
+}, { repeat: [10, 1] });
+const tactileMat = new THREE.MeshStandardMaterial({
+  map: tactileTex, color: 0xb9b1a1, roughness: 0.55, metalness: 0.08, polygonOffset: true, polygonOffsetFactor: -2
+});
+plane(9.3, 0.32, tactileMat, -4.2, 0.171, -0.98, { rx: -Math.PI / 2 });
+const sideTactileTex = repeatTex(tactileTex, 1, 9);
+plane(0.32, 7.8, new THREE.MeshStandardMaterial({
+  map: sideTactileTex, color: 0xb9b1a1, roughness: 0.55, metalness: 0.08, polygonOffset: true, polygonOffsetFactor: -2
+}), 0.48, 0.171, -4.9, { rx: -Math.PI / 2 });
+
+/* 排水沟 */
+const grateTex = canvasTex(256, 64, (ctx, w, h) => {
+  ctx.fillStyle = '#141a23';
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = '#46505e';
+  for (let x = 8; x < w; x += 18) ctx.fillRect(x, 6, 7, h - 12);
+  ctx.fillStyle = 'rgba(160,180,200,.16)';
+  for (let x = 8; x < w; x += 18) ctx.fillRect(x, 6, 2, h - 12);
+}, { repeat: [8, 1] });
+const grateMat = new THREE.MeshStandardMaterial({ map: grateTex, roughness: 0.45, metalness: 0.6, envMapIntensity: 1.2 });
+plane(9.4, 0.26, grateMat, -4.2, 0.012, -0.3, { rx: -Math.PI / 2 });
+plane(0.26, 7.6, new THREE.MeshStandardMaterial({ map: repeatTex(grateTex, 1, 7), roughness: 0.45, metalness: 0.6, envMapIntensity: 1.2 }), 1.1, 0.012, -4.7, { rx: -Math.PI / 2 });
+
+/* 井盖 */
+const manholeTex = canvasTex(256, 256, (ctx, w, h) => {
+  ctx.fillStyle = '#2b3340'; ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#4b5665'; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(128, 128, 110, 0, TAU); ctx.stroke();
+  ctx.beginPath(); ctx.arc(128, 128, 82, 0, TAU); ctx.stroke();
+  ctx.lineWidth = 3;
+  for (let i = 0; i < 16; i++) {
+    const a = i / 16 * TAU;
+    ctx.beginPath();
+    ctx.moveTo(128 + Math.cos(a) * 40, 128 + Math.sin(a) * 40);
+    ctx.lineTo(128 + Math.cos(a) * 80, 128 + Math.sin(a) * 80);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#4b5665';
+  ctx.fillRect(64, 122, 128, 12);
+});
+const manholeMat = new THREE.MeshStandardMaterial({ map: manholeTex, roughness: 0.33, metalness: 0.62, envMapIntensity: 1.3 });
+const manhole1 = new THREE.Mesh(new THREE.CircleGeometry(0.48, 32), manholeMat);
+manhole1.rotation.x = -Math.PI / 2;
+manhole1.position.set(-5.4, 0.018, 3.7);
+manhole1.receiveShadow = true;
+world.add(manhole1);
+const manhole2 = manhole1.clone();
+manhole2.position.set(3.15, 0.018, 1.2);
+manhole2.scale.setScalar(0.8);
+world.add(manhole2);
+
+/* ============================================================
+   路面标线
+   ============================================================ */
+const paintMat = new THREE.MeshStandardMaterial({ color: 0xccd7df, roughness: 0.42, metalness: 0.18, envMapIntensity: 0.9 });
+function paint(w, d, x, z, ry = 0) {
+  const m = plane(w, d, paintMat, x, 0.022, z, { rx: -Math.PI / 2 });
+  m.rotation.z = ry;
+  return m;
+}
+/* 中心虚线 */
+for (let x = -8.7; x < 0.5; x += 2.5) paint(1.3, 0.11, x, 2.48);
+for (let x = 6.0; x < 8.8; x += 2.5) paint(1.3, 0.11, x, 2.48);
+for (let z = -8.7; z < -1.0; z += 2.5) paint(0.11, 1.3, 3.16, z);
+for (let z = 6.0; z < 8.8; z += 2.5) paint(0.11, 1.3, 3.16, z);
+
+/* 停止线 */
+paint(2.1, 0.22, 2.1, -3.62);
+/* 斑马线：横穿前街 */
+for (let z = -0.05; z < 5.15; z += 0.72) paint(3.1, 0.4, -1.5, z);
+/* 斑马线：横穿侧街 */
+for (let x = 1.1; x < 5.3; x += 0.72) paint(0.4, 2.9, x, -1.75);
+
+/* 停车位 */
+paint(0.09, 4.9, 3.55, -5.85);
+paint(0.09, 4.9, 5.25, -5.85);
+paint(1.7, 0.09, 4.4, -8.28);
+paint(1.7, 0.09, 4.4, -3.42);
+box(0.5, 0.14, 0.22, std(0xc8a23c, { roughness: 0.5 }), 4.95, 0.09, -7.85, { outline: 1.04 });
+
+/* 止まれ */
+const tomareTex = canvasTex(512, 256, (ctx, w, h) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = 'rgba(225,232,238,.92)';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '900 120px "Yu Gothic", "Hiragino Kaku Gothic ProN", sans-serif';
+  ctx.fillText('止まれ', w / 2, h / 2);
+});
+const tomare = plane(2.4, 1.2, new THREE.MeshStandardMaterial({
+  map: tomareTex, transparent: true, roughness: 0.5, metalness: 0.15, depthWrite: false
+}), 2.12, 0.024, -5.6, { rx: -Math.PI / 2 });
+tomare.rotation.z = -0.03;
+
+/* ============================================================
+   便利店
+   ============================================================ */
+const S = { x0: -7.9, x1: -0.9, z0: -8.4, z1: -1.9, floorY: 0.2, h: 3.14 };
+
+const wallMat = toon(0xd8d3c6);
+const wallDarkMat = toon(0x2b3341);
+const trimMat = toon(0x333c4b);
+const creamMat = toon(0xe6e0d0);
+const shelfMat = toon(0xd7cfbf);
+const shelfDarkMat = toon(0x47505c);
+const metalMat = toon(0x8c98a6);
+const darkMetalMat = toon(0x303844);
+
+const store = new THREE.Group();
+world.add(store);
+
+/* 外墙 */
+const backWall = box(7.0, S.h, 0.18, wallMat, -4.4, 0.16 + S.h / 2, -8.31, { outline: 1.005, parent: store });
+const eastWall = box(0.18, S.h, 6.5, wallMat, -0.99, 0.16 + S.h / 2, -5.15, { outline: 1.007, parent: store });
+const westWall = box(0.18, S.h, 6.5, wallMat, -7.81, 0.16 + S.h / 2, -5.15, { outline: 1.007, parent: store });
+
+/* 上层立面 */
+box(7.0, 0.85, 0.16, creamMat, -4.4, 2.875, -1.98, { outline: 1.006, parent: store });
+/* 下层踢脚 */
+box(3.17, 0.42, 0.18, wallDarkMat, -6.135, 0.37, -1.98, { outline: 1.012, parent: store });
+box(1.97, 0.42, 0.18, wallDarkMat, -1.965, 0.37, -1.98, { outline: 1.012, parent: store });
+/* 角落竖向饰条 */
+box(0.16, 3.14, 0.14, trimMat, -7.82, 1.73, -1.99, { outline: 1.03, parent: store });
+box(0.16, 3.14, 0.14, trimMat, -0.98, 1.73, -1.99, { outline: 1.03, parent: store });
+
+/* 屋顶 */
+box(7.24, 0.14, 6.74, trimMat, -4.4, 3.37, -5.15, { outline: 1.004, parent: store });
+box(7.24, 0.22, 0.12, wallDarkMat, -4.4, 3.55, -8.42, { parent: store });
+box(7.24, 0.22, 0.12, wallDarkMat, -4.4, 3.55, -1.88, { parent: store });
+box(0.12, 0.22, 6.5, wallDarkMat, -8.0, 3.55, -5.15, { parent: store });
+box(0.12, 0.22, 6.5, wallDarkMat, -0.8, 3.55, -5.15, { parent: store });
+
+/* 玻璃幕墙 */
+const glassMat = new THREE.MeshStandardMaterial({
+  color: 0xbfe0f0, transparent: true, opacity: 0.11,
+  roughness: 0.05, metalness: 0.25, envMapIntensity: 1.5,
+  depthWrite: false, side: THREE.DoubleSide
+});
+const glassFrontL = plane(3.17, 1.87, glassMat, -6.135, 1.515, -1.905, { parent: store });
+glassFrontL.renderOrder = 5;
+const glassFrontR = plane(1.97, 1.87, glassMat, -1.965, 1.515, -1.905, { parent: store });
+glassFrontR.renderOrder = 5;
+
+/* 窗框 */
+const frameMat = toon(0x222a36);
+[-7.72, -6.14, -1.965, -0.98].forEach((x) => {
+  box(0.065, 1.93, 0.1, frameMat, x, 1.505, -1.94, { outline: 1.04, parent: store });
+});
+box(3.2, 0.06, 0.1, frameMat, -6.135, 2.445, -1.94, { parent: store });
+box(1.99, 0.06, 0.1, frameMat, -1.965, 2.445, -1.94, { parent: store });
+box(3.2, 0.06, 0.1, frameMat, -6.135, 0.585, -1.94, { parent: store });
+box(1.99, 0.06, 0.1, frameMat, -1.965, 0.585, -1.94, { parent: store });
+/* 门侧框 */
+box(0.085, 2.34, 0.12, frameMat, -4.55, 1.35, -1.94, { outline: 1.04, parent: store });
+box(0.085, 2.34, 0.12, frameMat, -2.95, 1.35, -1.94, { outline: 1.04, parent: store });
+box(1.68, 0.08, 0.12, frameMat, -3.75, 2.46, -1.94, { parent: store });
+box(1.68, 0.05, 0.14, trimMat, -3.75, 2.53, -1.88, { parent: store });
+/* 传感器 */
+box(0.34, 0.11, 0.14, darkMetalMat, -3.75, 2.63, -1.83, { outline: 1.06, parent: store });
+const sensorLED = new THREE.Mesh(new THREE.SphereGeometry(0.018, 8, 8), basic(0xff5544));
+sensorLED.position.set(-3.91, 2.62, -1.75);
+store.add(sensorLED);
+
+/* 自动门 */
+const doorGlassMat = new THREE.MeshStandardMaterial({
+  color: 0xc8e6f2, transparent: true, opacity: 0.12,
+  roughness: 0.06, metalness: 0.2, envMapIntensity: 1.4, depthWrite: false
+});
+function makeDoorLeaf(cx) {
+  const g = new THREE.Group();
+  g.position.set(cx, 0, 0);
+  const frame = toon(0x2a323f);
+  box(0.78, 0.05, 0.07, frame, 0, 0.28, -1.91, { parent: g });
+  box(0.78, 0.05, 0.07, frame, 0, 2.36, -1.91, { parent: g });
+  box(0.05, 2.13, 0.07, frame, -0.365, 1.32, -1.91, { parent: g });
+  box(0.05, 2.13, 0.07, frame, 0.365, 1.32, -1.91, { parent: g });
+  const glass = plane(0.69, 2.03, doorGlassMat, 0, 1.32, -1.905, { parent: g });
+  glass.renderOrder = 6;
+  const handle = box(0.035, 0.55, 0.05, metalMat, 0.29, 1.25, -1.86, { parent: g });
+  handle.castShadow = false;
+  store.add(g);
+  return g;
+}
+const doorL = makeDoorLeaf(-4.16);
+const doorR = makeDoorLeaf(-3.34);
+doorR.position.z = 0.02;
+
+/* 窗贴 */
+const coffeeDecal = plane(0.56, 0.7, basic(0xffffff, { map: coffeeDecalTex, transparent: true }), -5.35, 1.55, -1.868, { parent: store });
+coffeeDecal.renderOrder = 7;
+const smallStickerTex = canvasTex(128, 128, (ctx, w, h) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#2d6fbe';
+  ctx.beginPath(); ctx.arc(64, 64, 58, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#fffdf3';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = '900 58px Arial'; ctx.fillText('24', 64, 62);
+  ctx.font = '700 17px Arial'; ctx.fillText('HOURS', 64, 99);
+});
+const sticker = plane(0.28, 0.28, basic(0xffffff, { map: smallStickerTex, transparent: true }), -6.9, 1.95, -1.868, { parent: store });
+sticker.renderOrder = 7;
+
+/* 右侧橱窗海报 */
+const hotFoodTex = canvasTex(300, 400, (ctx, w, h) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = 'rgba(255,248,232,.96)';
+  ctx.beginPath();
+  ctx.roundRect(6, 6, w - 12, h - 12, 12);
+  ctx.fill();
+  ctx.fillStyle = '#e8663e';
+  ctx.fillRect(6, 6, w - 12, 66);
+  ctx.fillStyle = '#fff7e8';
+  ctx.textAlign = 'center';
+  ctx.font = '900 34px Arial, sans-serif';
+  ctx.fillText('HOT SNACK', w / 2, 50);
+  /* 饭团 */
+  ctx.fillStyle = '#fffdf6';
+  ctx.strokeStyle = '#d8cfbc';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(w / 2, 108);
+  ctx.lineTo(w / 2 + 84, 248);
+  ctx.lineTo(w / 2 - 84, 248);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#243c30';
+  ctx.beginPath();
+  ctx.roundRect(w / 2 - 48, 202, 96, 58, 8);
+  ctx.fill();
+  ctx.fillStyle = '#fffdf6';
+  ctx.fillRect(w / 2 - 26, 150, 52, 30);
+  ctx.fillStyle = '#e8663e';
+  ctx.beginPath();
+  ctx.arc(w / 2, 314, 34, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = '#fff7e8';
+  ctx.font = '900 21px Arial';
+  ctx.fillText('100', w / 2, 320);
+  ctx.fillStyle = '#8d5a37';
+  ctx.font = '700 20px Arial';
+  ctx.fillText('FRESHLY MADE', w / 2, 366);
+});
+const hotFoodPoster = plane(0.44, 0.6, basic(0xffffff, { map: hotFoodTex, transparent: true }), -2.32, 1.55, -1.862, { parent: store });
+hotFoodPoster.renderOrder = 7;
+
+/* 玻璃反光条 */
+const glassStreakTex = canvasTex(256, 512, (ctx, w, h) => {
+  const g = ctx.createLinearGradient(0, 0, w, h);
+  g.addColorStop(0, 'rgba(255,255,255,0)');
+  g.addColorStop(0.44, 'rgba(200,230,255,.5)');
+  g.addColorStop(0.52, 'rgba(255,255,255,.8)');
+  g.addColorStop(0.6, 'rgba(180,220,255,.16)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+});
+const glassStreakMat = new THREE.MeshBasicMaterial({
+  map: glassStreakTex, transparent: true, opacity: 0.08,
+  blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide
+});
+const gs1 = plane(2.6, 1.7, glassStreakMat, -6.2, 1.55, -1.87, { parent: store });
+gs1.rotation.z = -0.5;
+gs1.renderOrder = 8;
+const gs2 = plane(1.5, 1.3, glassStreakMat, -1.85, 1.55, -1.87, { parent: store });
+gs2.rotation.z = -0.5;
+gs2.renderOrder = 8;
+
+/* 主招牌 */
+box(6.78, 0.8, 0.12, trimMat, -4.4, 2.9, -1.84, { outline: 1.008, parent: store });
+const storeSignMat = basic(0xffffff, { map: storeSignTex, toneMapped: false });
+const storeSign = plane(6.62, 0.7, storeSignMat, -4.4, 2.9, -1.775, { parent: store });
+storeSign.renderOrder = 2;
+
+/* 侧挂灯箱 */
+const projGroup = new THREE.Group();
+projGroup.position.set(-0.94, 2.72, -2.24);
+store.add(projGroup);
+box(0.8, 1.18, 0.13, trimMat, 0.4, 0, 0, { outline: 1.04, parent: projGroup });
+const projMat = basic(0xffffff, { map: projSignTex, toneMapped: false });
+const projFace1 = plane(0.72, 1.08, projMat, 0.4, 0, 0.071, { parent: projGroup });
+projFace1.renderOrder = 3;
+const projFace2 = plane(0.72, 1.08, projMat, 0.4, 0, -0.071, { parent: projGroup, ry: Math.PI });
+projFace2.renderOrder = 3;
+const projGlow = glow(0xbfe0ff, 2.4, 0.22);
+projGlow.position.set(-0.5, 2.75, -2.2);
+
+/* 雨棚 */
+const awningGroup = new THREE.Group();
+awningGroup.position.set(-4.4, 2.49, -1.2);
+awningGroup.rotation.x = 0.055;
+store.add(awningGroup);
+const awningMat = toon(0x26384b);
+box(6.86, 0.07, 1.42, awningMat, 0, 0, 0, { outline: 1.01, parent: awningGroup });
+box(6.86, 0.11, 0.06, wallDarkMat, 0, -0.07, 0.71, { parent: awningGroup });
+box(6.86, 0.025, 0.04, basic(0x7fd3c4), 0, -0.12, 0.735, { parent: awningGroup, cast: false });
+/* 雨棚支撑杆 */
+const rodMat = toon(0x353d49);
+tube(new THREE.Vector3(-7.4, 2.42, -0.52), new THREE.Vector3(-7.4, 3.02, -1.95), 0.025, rodMat, store);
+tube(new THREE.Vector3(-1.42, 2.42, -0.52), new THREE.Vector3(-1.42, 3.02, -1.95), 0.025, rodMat, store);
+tube(new THREE.Vector3(-4.4, 2.42, -0.52), new THREE.Vector3(-4.4, 3.02, -1.95), 0.02, rodMat, store);
+/* 雨棚射灯 */
+const downlightMat = basic(0xffe2ae, { toneMapped: false });
+const downlightPositions = [-6.8, -4.4, -2.0];
+downlightPositions.forEach((x) => {
+  cyl(0.09, 0.11, 0.05, 12, darkMetalMat, x, 2.4, -1.0, { parent: store, cast: false });
+  cyl(0.075, 0.075, 0.012, 12, downlightMat, x, 2.372, -1.0, { parent: store, cast: false });
+  const s = glow(0xffc98a, 0.85, 0.18);
+  s.position.set(x, 2.33, -1.0);
+});
+
+/* 门外地垫 */
+const matTex = canvasTex(512, 256, (ctx, w, h) => {
+  ctx.fillStyle = '#242b35';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#c9c2b2';
+  ctx.lineWidth = 12;
+  ctx.strokeRect(18, 18, w - 36, h - 36);
+  ctx.fillStyle = '#c9c2b2';
+  ctx.font = '700 54px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('WELCOME', w / 2, h / 2);
+});
+const doorMat = plane(1.62, 0.78, new THREE.MeshStandardMaterial({
+  map: matTex, roughness: 0.85, metalness: 0.02
+}), -3.75, 0.173, -1.28, { rx: -Math.PI / 2, receive: true });
+
+/* 室内地板 */
+const floorMat = new THREE.MeshStandardMaterial({
+  map: tileFloorTex, roughness: 0.26, metalness: 0.12, envMapIntensity: 0.35
+});
+plane(6.84, 6.42, floorMat, -4.4, 0.201, -5.15, { rx: -Math.PI / 2, receive: true });
+
+/* 室内天花 */
+const ceilingMat = toon(0xb9b0a2);
+plane(6.84, 6.42, ceilingMat, -4.4, 2.78, -5.15, { rx: Math.PI / 2 });
+/* 天花灯带 */
+const ceilLightMat = basic(0xfff3d6, { toneMapped: false });
+[-6.2, -4.4, -2.6].forEach((x) => {
+  [-6.7, -4.4, -2.1].forEach((z) => {
+    box(0.82, 0.028, 0.26, ceilLightMat, x, 2.765, z, { cast: false, receive: false, parent: store });
+  });
+});
+/* 天花横梁 */
+[-4.7, -6.3].forEach((z) => box(6.8, 0.07, 0.09, trimMat, -4.4, 2.77, z, { cast: false, parent: store }));
+
+/* 后墙冷柜 */
+const fridgeInnerMat = basic(0xa9dcec);
+const fridgeFrameMat = toon(0x2b3441);
+const bottleColors = [0xff8c68, 0x6fc3ff, 0x83d98f, 0xffd468, 0xff9bc4, 0xb99bff, 0xeaf6ff, 0xffb56b];
+const bottleInstances = [];
+function addFridge(cx) {
+  const w = 1.26, h = 2.3, frontZ = -7.74;
+  box(w, 0.08, 0.6, fridgeFrameMat, cx, 2.49, -8.05, { parent: store, cast: false });
+  box(w, 0.08, 0.6, fridgeFrameMat, cx, 0.33, -8.05, { parent: store, cast: false });
+  box(0.07, h, 0.6, fridgeFrameMat, cx - w / 2 + 0.035, 1.41, -8.05, { parent: store, cast: false });
+  box(0.07, h, 0.6, fridgeFrameMat, cx + w / 2 - 0.035, 1.41, -8.05, { parent: store, cast: false });
+  plane(w - 0.13, h - 0.2, fridgeInnerMat, cx, 1.41, -8.235, { parent: store, receive: false });
+  /* 货架横杆 */
+  [0.42, 0.9, 1.35, 1.8, 2.25].forEach((y) => {
+    box(w - 0.12, 0.025, 0.02, fridgeFrameMat, cx, y, -8.11, { parent: store, cast: false });
+  });
+  for (let r = 0; r < 4; r++) {
+    for (let i = 0; i < 6; i++) {
+      bottleInstances.push({
+        x: cx - 0.47 + i * 0.19 + rand(-0.015, 0.015),
+        y: 0.56 + r * 0.45,
+        z: -8.06 + rand(-0.02, 0.02),
+        color: pick(bottleColors)
+      });
+    }
+  }
+  const glass = plane(w - 0.14, h - 0.16, glassMat, cx, 1.41, frontZ, { parent: store });
+  glass.renderOrder = 6;
+  box(0.035, 0.5, 0.05, metalMat, cx + w / 2 - 0.15, 1.35, frontZ + 0.01, { parent: store, cast: false });
+  box(w, 0.035, 0.06, fridgeFrameMat, cx, 2.45, frontZ + 0.01, { parent: store, cast: false });
+}
+addFridge(-7.05);
+addFridge(-5.75);
+addFridge(-4.45);
+
+/* 冷柜顶部灯箱 */
+const drinkHeaderTex = labelTex('DRINKS', '#e8f7ff', '#1a5b8f', 'COLD  ·  COLD  ·  COLD');
+const drinkHeader = plane(3.85, 0.22, basic(0xffffff, { map: drinkHeaderTex, toneMapped: false }), -5.75, 2.62, -7.7, { parent: store });
+drinkHeader.renderOrder = 3;
+
+/* 后场门 */
+box(0.92, 2.0, 0.08, toon(0xcdc6b7), -2.72, 1.2, -8.27, { outline: 1.03, parent: store });
+box(0.4, 0.52, 0.03, basic(0xffe3b0, { transparent: true, opacity: 0.85 }), -2.72, 1.7, -8.22, { parent: store, cast: false });
+box(0.6, 0.05, 0.06, metalMat, -2.72, 1.03, -8.2, { parent: store });
+const staffSignTex = labelTex('STAFF ONLY', '#f0ece0', '#6a7586');
+plane(0.5, 0.14, basic(0xffffff, { map: staffSignTex }), -2.72, 2.42, -8.22, { parent: store });
+
+/* 吊挂灯箱 */
+function hangingSign(text, sub, x, y, z, w = 1.15, warm = false) {
+  const tex = labelTex(text, warm ? '#ff9a55' : '#f7f1e1', warm ? '#fff6e6' : '#243552', sub);
+  box(w, 0.36, 0.07, trimMat, x, y, z, { outline: 1.05, parent: store });
+  const f = plane(w - 0.04, 0.32, basic(0xffffff, { map: tex, toneMapped: false }), x, y, z + 0.041, { parent: store });
+  f.renderOrder = 3;
+  const f2 = plane(w - 0.04, 0.32, basic(0xffffff, { map: tex, toneMapped: false }), x, y, z - 0.041, { parent: store, ry: Math.PI });
+  f2.renderOrder = 3;
+  tube(new THREE.Vector3(x - w * 0.3, y + 0.18, z), new THREE.Vector3(x - w * 0.3, 2.77, z), 0.008, darkMetalMat, store);
+  tube(new THREE.Vector3(x + w * 0.3, y + 0.18, z), new THREE.Vector3(x + w * 0.3, 2.77, z), 0.008, darkMetalMat, store);
+}
+hangingSign('COFFEE', 'HOT & ICED', -3.6, 2.06, -3.95);
+hangingSign('HOT SNACK', 'FRIED & WARM', -2.1, 2.06, -4.45, 1.0, true);
+
+/* 中央货架 */
+const productInstances = [];
+const productColors = [0xff5c4d, 0xffc83d, 0x42c97a, 0x3f9bff, 0xff79b8, 0x9b7bff, 0xffdca0, 0xf4f7fa, 0x4fded0, 0xff8a2b, 0x7fc24f, 0xd8cbb6, 0xe74f87, 0x35b8c4];
+function addProduct(x, y, z, sx, sy, sz, color, ry = 0) {
+  productInstances.push({ x, y, z, sx, sy, sz, color, ry });
+}
+function addGondola(cz) {
+  const x0 = -7.3, x1 = -3.92, cx = (x0 + x1) / 2, w = x1 - x0, d = 0.86;
+  box(0.07, 1.26, d, shelfDarkMat, x0, 0.83, cz, { parent: store, outline: 1.02 });
+  box(0.07, 1.26, d, shelfDarkMat, x1, 0.83, cz, { parent: store, outline: 1.02 });
+  box(w, 1.26, 0.055, shelfDarkMat, cx, 0.83, cz, { parent: store });
+  [0.63, 1.03, 1.33].forEach((y) => {
+    box(w, 0.035, d, shelfMat, cx, y, cz, { parent: store, cast: false });
+    if (y < 1.3) {
+      box(w, 0.045, 0.02, basic(0xf7f3e7), cx, y - 0.03, cz + d / 2 + 0.005, { parent: store, cast: false });
+      box(w, 0.045, 0.02, basic(0xf7f3e7), cx, y - 0.03, cz - d / 2 - 0.005, { parent: store, cast: false });
+    }
+  });
+  for (let i = 0; i < 13; i++) {
+    if (Math.random() < 0.04) continue;
+    const x = x0 + 0.22 + i * 0.25;
+    for (const side of [-1, 1]) {
+      const z = cz + side * 0.29;
+      const h = rand(0.16, 0.26);
+      addProduct(x + rand(-0.02, 0.02), 0.66 + h / 2, z, rand(0.13, 0.2), h, rand(0.17, 0.26), pick(productColors), rand(-0.08, 0.08));
+      if (Math.random() < 0.85) {
+        const h2 = rand(0.14, 0.23);
+        addProduct(x + rand(-0.02, 0.02), 1.06 + h2 / 2, z, rand(0.11, 0.18), h2, rand(0.16, 0.25), pick(productColors), rand(-0.08, 0.08));
+      }
+    }
+    if (i % 2 === 0) {
+      addProduct(x, 1.44, cz + rand(-0.28, 0.28), rand(0.18, 0.26), rand(0.16, 0.25), rand(0.18, 0.28), pick(productColors), rand(-0.15, 0.15));
+    }
+  }
+  /* 价格标签 */
+  [0.63, 1.03].forEach((y) => {
+    for (let i = 0; i < 11; i++) {
+      for (const side of [-1, 1]) {
+        addProduct(x0 + 0.3 + i * 0.29, y - 0.012, cz + side * (d / 2 + 0.012), 0.075, 0.04, 0.014, pick([0xffe36b, 0x6fd7ff, 0xff7b6b, 0x7ff0c0]), 0);
+      }
+    }
+  });
+}
+addGondola(-4.38);
+addGondola(-6.08);
+
+/* 杂志架 */
+box(0.06, 1.15, 1.7, shelfDarkMat, -7.7, 0.78, -3.05, { parent: store, outline: 1.02 });
+[0.55, 0.92, 1.22].forEach((y, level) => {
+  box(0.42, 0.03, 1.6, shelfMat, -7.48, y, -3.05, { parent: store, cast: false });
+  for (let i = 0; i < 8; i++) {
+    addProduct(-7.44, y + 0.17, -3.7 + i * 0.19, 0.035, 0.28, 0.16, pick(productColors), 0);
+  }
+});
+const magSignTex = labelTex('MAGAZINES', '#f0eee4', '#33425c');
+plane(0.9, 0.18, basic(0xffffff, { map: magSignTex }), -7.66, 1.62, -3.05, { parent: store, ry: Math.PI / 2 });
+
+/* 收银台 */
+box(2.0, 0.94, 0.9, toon(0xbcae97), -2.25, 0.67, -3.6, { outline: 1.012, parent: store });
+box(2.04, 0.06, 0.96, toon(0x6b5640), -2.25, 1.17, -3.6, { parent: store });
+box(2.0, 0.12, 0.02, basic(0xf3ead6), -2.25, 0.74, -3.14, { parent: store, cast: false });
+box(1.84, 0.16, 0.025, basic(0x4f9d94), -2.25, 0.9, -3.145, { parent: store, cast: false });
+box(1.84, 0.025, 0.028, basic(0xfff2d6), -2.25, 0.81, -3.144, { parent: store, cast: false });
+const counterLogo = plane(0.72, 0.13, basic(0xffffff, { map: labelTex('HOSHI MART', '#f8f3e6', '#2d6f6a') }), -2.25, 0.9, -3.13, { parent: store });
+counterLogo.renderOrder = 3;
+/* 收银机 */
+box(0.4, 0.24, 0.34, darkMetalMat, -2.8, 1.31, -3.72, { parent: store, outline: 1.04 });
+const registerScreen = box(0.34, 0.22, 0.03, basic(0xa6ffd0, { toneMapped: false }), -2.8, 1.45, -3.79, { parent: store, cast: false });
+registerScreen.rotation.x = -0.24;
+box(0.26, 0.06, 0.2, darkMetalMat, -2.38, 1.22, -3.48, { parent: store });
+/* 热食柜 */
+box(0.72, 0.42, 0.42, darkMetalMat, -1.8, 1.29, -3.55, { parent: store, outline: 1.04 });
+box(0.66, 0.36, 0.36, basic(0xffc36d, { toneMapped: false }), -1.8, 1.3, -3.55, { parent: store, cast: false });
+for (let i = 0; i < 5; i++) {
+  addProduct(-2.0 + i * 0.09, 1.36, -3.55 + rand(-0.08, 0.08), 0.08, 0.07, 0.08, 0xd58b3e, rand(-0.3, 0.3));
+}
+plane(0.66, 0.3, glassMat, -1.8, 1.3, -3.36, { parent: store }).renderOrder = 6;
+
+/* 后场柜台 */
+box(0.78, 0.92, 2.9, toon(0xb8ac97), -1.6, 0.66, -5.95, { parent: store, outline: 1.01 });
+box(0.82, 0.05, 2.94, toon(0x65513d), -1.6, 1.14, -5.95, { parent: store });
+/* 咖啡机 */
+box(0.48, 0.62, 0.44, darkMetalMat, -1.62, 1.48, -5.45, { parent: store, outline: 1.04 });
+const coffeeScreen = plane(0.24, 0.16, basic(0x8be3ff, { toneMapped: false }), -1.87, 1.62, -5.45, { parent: store, ry: -Math.PI / 2 });
+coffeeScreen.renderOrder = 3;
+box(0.05, 0.16, 0.12, basic(0xff5a45, { toneMapped: false }), -1.88, 1.4, -5.45, { parent: store, cast: false });
+/* 纸杯 */
+for (let i = 0; i < 4; i++) {
+  cyl(0.035, 0.028, 0.1, 8, basic(0xf6f2e8), -1.42, 1.23 + i * 0.045, -5.78, { parent: store, cast: false });
+}
+/* 关东煮 */
+cyl(0.28, 0.28, 0.2, 16, metalMat, -1.62, 1.26, -4.86, { parent: store, outline: 1.02 });
+plane(0.5, 0.5, basic(0xffb84d), -1.62, 1.365, -4.86, { parent: store, rx: -Math.PI / 2, cast: false });
+for (let i = 0; i < 7; i++) {
+  addProduct(-1.62 + rand(-0.17, 0.17), 1.4, -4.86 + rand(-0.17, 0.17), 0.06, 0.05, 0.06, pick([0xe0a75b, 0xd6c08c, 0xb97a45]), rand(0, TAU));
+}
+/* 烟架 */
+box(0.06, 1.25, 1.9, basic(0xffefd2, { toneMapped: false }), -1.14, 1.85, -5.9, { parent: store, cast: false });
+for (let r = 0; r < 4; r++) {
+  for (let c = 0; c < 9; c++) {
+    addProduct(-1.2, 1.36 + r * 0.24, -6.7 + c * 0.2, 0.035, 0.14, 0.16, pick(productColors), 0);
+  }
+}
+/* 柜台后灯箱 */
+const atmSignTex = labelTex('ATM', '#eef4f5', '#2c5a73', 'CASH  ·  CARD');
+plane(0.62, 0.2, basic(0xffffff, { map: atmSignTex }), -1.22, 2.2, -7.0, { parent: store, ry: -Math.PI / 2 });
+
+/* 地面导视 */
+const arrowTex = canvasTex(256, 256, (ctx, w, h) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#52b7b0';
+  ctx.beginPath();
+  ctx.moveTo(128, 40); ctx.lineTo(200, 120); ctx.lineTo(154, 120);
+  ctx.lineTo(154, 210); ctx.lineTo(102, 210); ctx.lineTo(102, 120);
+  ctx.lineTo(56, 120); ctx.closePath(); ctx.fill();
+});
+plane(0.42, 0.42, basic(0xffffff, { map: arrowTex, transparent: true, opacity: 0.85 }), -3.0, 0.208, -2.3, { sx: 0, rx: -Math.PI / 2 }).rotation.z = Math.PI;
+
+/* 店内海报 */
+function posterTex(hue, hue2, kind = 0) {
+  return canvasTex(512, 720, (ctx, w, h) => {
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, hue);
+    g.addColorStop(1, hue2);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+    if (kind % 3 === 0) {
+      ctx.fillStyle = 'rgba(255,255,255,.88)';
+      ctx.beginPath(); ctx.arc(w * .5, h * .34, 120, 0, TAU); ctx.fill();
+      ctx.fillStyle = 'rgba(255,120,90,.9)';
+      ctx.beginPath(); ctx.arc(w * .5, h * .34, 62, 0, TAU); ctx.fill();
+    } else if (kind % 3 === 1) {
+      ctx.strokeStyle = 'rgba(255,255,255,.8)';
+      ctx.lineWidth = 22;
+      ctx.beginPath(); ctx.arc(w * .5, h * .35, 110, 0.4, Math.PI * 1.5); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,.9)';
+      ctx.beginPath(); ctx.arc(w * .5, h * .35, 28, 0, TAU); ctx.fill();
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,.85)';
+      ctx.save();
+      ctx.translate(w / 2, h * .3);
+      ctx.rotate(-0.3);
+      ctx.fillRect(-120, -40, 240, 80);
+      ctx.restore();
+    }
+    ctx.fillStyle = 'rgba(255,255,255,.94)';
+    ctx.font = '900 62px Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(['NEW', 'SALE', 'HOT'][kind % 3], w / 2, h * .62);
+    ctx.font = '700 30px Arial';
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    ctx.fillText(['SEASONAL ITEM', 'LIMITED TIME', 'FRESH DAILY'][kind % 3], w / 2, h * .69);
+    ctx.fillStyle = 'rgba(255,255,255,.55)';
+    for (let i = 0; i < 3; i++) ctx.fillRect(110, h * .76 + i * 34, w - 220, 10);
+  });
+}
+const posterA = posterTex('#e87452', '#a8422d', 0);
+const posterB = posterTex('#4f8fd0', '#244b80', 1);
+const posterC = posterTex('#d9a13b', '#7d4f24', 2);
+plane(0.78, 1.1, basic(0xffffff, { map: posterA }), -3.22, 1.55, -8.2, { parent: store });
+plane(0.78, 1.1, basic(0xffffff, { map: posterB }), -2.4, 1.55, -8.2, { parent: store });
+
+/* 店内灯光 */
+[
+  [-5.8, 2.45, -3.6, 18, 0xffd9a1],
+  [-3.55, 2.45, -5.9, 15, 0xffdcaa],
+  [-5.6, 2.4, -7.1, 12, 0xffd6a0],
+  [-2.1, 2.35, -4.6, 8, 0xffcf96]
+].forEach(([x, y, z, i, c]) => {
+  const l = new THREE.PointLight(c, i, 8.5, 2);
+  l.position.set(x, y, z);
+  scene.add(l);
+});
+/* 店面外暖光 */
+[[-5.3, 2.05, -0.9, 4.2], [-2.1, 2.05, -0.9, 3.5]].forEach(([x, y, z, i]) => {
+  const l = new THREE.PointLight(0xffc887, i, 5.5, 2);
+  l.position.set(x, y, z);
+  scene.add(l);
+});
+
+/* 招牌光晕 */
+const signGlow = glow(0xfff0cf, 7.0, 0.065);
+signGlow.position.set(-4.4, 2.9, -1.6);
+
+/* ============================================================
+   街角道具
+   ============================================================ */
+/* 自动贩卖机贴图 */
+const vendingTex = canvasTex(256, 512, (ctx, w, h) => {
+  ctx.fillStyle = '#aebfc4';
+  ctx.fillRect(0, 0, w, h);
+
+  /* 顶部招牌 */
+  ctx.fillStyle = '#173746';
+  ctx.fillRect(0, 0, w, 46);
+  ctx.fillStyle = '#dff5ff';
+  ctx.font = '700 23px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('COLD DRINK', w / 2, 24);
+
+  /* 展示窗 */
+  ctx.fillStyle = '#eef9fc';
+  ctx.fillRect(14, 56, w - 28, 330);
+  ctx.strokeStyle = '#2d5466';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(14, 56, w - 28, 330);
+
+  const cols = ['#d94b3f', '#2f7fc9', '#36a965', '#eaa72c', '#7656c6', '#d95f96', '#e97a32', '#32a9a4', '#b94361'];
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      const x = 28 + c * 75, y = 68 + r * 108;
+      ctx.fillStyle = '#f7fcff';
+      ctx.beginPath();
+      ctx.roundRect(x, y, 56, 94, 7);
+      ctx.fill();
+      ctx.fillStyle = cols[r * 3 + c];
+      ctx.beginPath();
+      ctx.roundRect(x + 8, y + 8, 40, 58, 8);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,.86)';
+      ctx.fillRect(x + 12, y + 20, 32, 16);
+      ctx.fillStyle = 'rgba(255,255,255,.5)';
+      ctx.fillRect(x + 12, y + 12, 6, 12);
+      ctx.fillStyle = '#243845';
+      ctx.font = '700 11px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('¥' + (110 + r * 20 + c * 10), x + 28, y + 78);
+      ctx.fillStyle = '#eef9fc';
+      ctx.fillRect(x + 12, y + 83, 32, 2);
+    }
+  }
+  /* 按钮区 */
+  ctx.fillStyle = '#22313c';
+  ctx.fillRect(0, 398, w, 114);
+  ctx.fillStyle = '#66808c';
+  ctx.fillRect(28, 414, w - 56, 24);
+  ctx.fillStyle = '#0d1419';
+  ctx.beginPath();
+  ctx.roundRect(52, 454, 152, 18, 6);
+  ctx.fill();
+  for (let i = 0; i < 5; i++) {
+    ctx.fillStyle = ['#ffb24d', '#7bd1ff', '#ff7d7d', '#9cffb2', '#d4b6ff'][i];
+    ctx.beginPath();
+    ctx.arc(40 + i * 44, 438, 8, 0, TAU);
+    ctx.fill();
+  }
+  ctx.fillStyle = 'rgba(255,255,255,.22)';
+  ctx.fillRect(8, 52, 3, 330);
+});
+
+/* 风扇网罩 */
+const fanTex = canvasTex(256, 256, (ctx, w, h) => {
+  ctx.fillStyle = '#242b34';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#7b8794';
+  ctx.lineWidth = 3;
+  for (let r = 24; r < 122; r += 13) {
+    ctx.beginPath(); ctx.arc(128, 128, r, 0, TAU); ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(155,170,185,.6)';
+  for (let i = 0; i < 24; i++) {
+    const a = i / 24 * TAU;
+    ctx.beginPath();
+    ctx.moveTo(128 + Math.cos(a) * 20, 128 + Math.sin(a) * 20);
+    ctx.lineTo(128 + Math.cos(a) * 120, 128 + Math.sin(a) * 120);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#4d5967';
+  ctx.beginPath(); ctx.arc(128, 128, 20, 0, TAU); ctx.fill();
+});
+const bladeTex = canvasTex(256, 256, (ctx, w, h) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.translate(128, 128);
+  for (let i = 0; i < 3; i++) {
+    ctx.save();
+    ctx.rotate(i / 3 * TAU);
+    ctx.fillStyle = 'rgba(150,164,176,.5)';
+    ctx.beginPath();
+    ctx.ellipse(0, -62, 28, 58, 0.5, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle = '#68737e';
+  ctx.beginPath(); ctx.arc(0, 0, 16, 0, TAU); ctx.fill();
+});
+
+/* 电线杆底纹 */
+const stripeTex = canvasTex(256, 64, (ctx, w, h) => {
+  ctx.fillStyle = '#d8b23d';
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = '#1c2026';
+  for (let x = -h; x < w + h; x += 34) {
+    ctx.save();
+    ctx.translate(x, 0);
+    ctx.rotate(-0.4);
+    ctx.fillRect(0, -20, 15, h + 60);
+    ctx.restore();
+  }
+}, { repeat: [3, 1] });
+
+/* 街道路牌 */
+const streetSignTexA = canvasTex(512, 128, (ctx, w, h) => {
+  ctx.fillStyle = '#2c5b49';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#e6eee8';
+  ctx.lineWidth = 7;
+  ctx.strokeRect(9, 9, w - 18, h - 18);
+  ctx.fillStyle = '#f3f7f1';
+  ctx.textAlign = 'center';
+  ctx.font = '700 42px Arial';
+  ctx.fillText('HOSHIMI ST.', w / 2, 58);
+  ctx.font = '500 23px "Yu Gothic", sans-serif';
+  ctx.fillText('星見町', w / 2, 94);
+});
+const streetSignTexB = canvasTex(512, 128, (ctx, w, h) => {
+  ctx.fillStyle = '#2c5b49';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#e6eee8';
+  ctx.lineWidth = 7;
+  ctx.strokeRect(9, 9, w - 18, h - 18);
+  ctx.fillStyle = '#f3f7f1';
+  ctx.textAlign = 'center';
+  ctx.font = '700 42px Arial';
+  ctx.fillText('SAKURA AVE.', w / 2, 58);
+  ctx.font = '500 23px "Yu Gothic", sans-serif';
+  ctx.fillText('桜通り', w / 2, 94);
+});
+
+/* P 牌 */
+const pSignTex = canvasTex(256, 320, (ctx, w, h) => {
+  ctx.fillStyle = '#f2f5f7';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#274b74';
+  ctx.lineWidth = 12;
+  ctx.strokeRect(10, 10, w - 20, h - 20);
+  ctx.fillStyle = '#2b64a5';
+  ctx.textAlign = 'center';
+  ctx.font = '900 170px Arial';
+  ctx.fillText('P', w / 2, 184);
+  ctx.font = '700 30px Arial';
+  ctx.fillText('PARKING', w / 2, 240);
+  ctx.font = '600 22px Arial';
+  ctx.fillStyle = '#647688';
+  ctx.fillText('24 HOURS', w / 2, 278);
+});
+
+/* 公告栏 */
+const noticeGroup = new THREE.Group();
+world.add(noticeGroup);
+box(0.08, 1.05, 1.42, toon(0x3a2f28), -0.83, 1.92, -4.72, { outline: 1.02, parent: noticeGroup });
+box(0.03, 0.93, 1.3, basic(0x5d5148), -0.785, 1.92, -4.72, { parent: noticeGroup, cast: false });
+const noticePosterA = plane(0.5, 0.7, basic(0xffffff, { map: posterB }), -0.762, 1.96, -5.06, { parent: noticeGroup, ry: Math.PI / 2 });
+noticePosterA.renderOrder = 3;
+const noticePosterB = plane(0.46, 0.62, basic(0xffffff, { map: posterC }), -0.762, 1.92, -4.48, { parent: noticeGroup, ry: Math.PI / 2 });
+noticePosterB.renderOrder = 3;
+box(0.05, 0.03, 1.3, toon(0x241f1b), -0.78, 2.4, -4.72, { parent: noticeGroup });
+
+/* 外墙底部瓷砖带 / 线脚 / 落水管 */
+const wallTileTex = canvasTex(512, 256, (ctx, w, h) => {
+  ctx.fillStyle = '#45525e';
+  ctx.fillRect(0, 0, w, h);
+  for (let y = 0; y < h; y += 64) {
+    for (let x = 0; x < w; x += 128) {
+      ctx.fillStyle = (x / 128 + y / 64) % 2 === 0 ? '#4a5864' : '#414d59';
+      ctx.fillRect(x + 2, y + 2, 124, 60);
+      ctx.fillStyle = 'rgba(180,195,205,.07)';
+      ctx.fillRect(x + 4, y + 4, 120, 3);
+    }
+  }
+}, { repeat: [3, 1] });
+plane(6.4, 0.78, new THREE.MeshStandardMaterial({
+  map: wallTileTex, roughness: 0.5, metalness: 0.18, envMapIntensity: 0.7
+}), -0.897, 0.55, -5.15, { ry: Math.PI / 2, receive: true });
+box(0.045, 0.06, 6.42, trimMat, -0.885, 0.96, -5.15, { parent: store, cast: false });
+box(0.04, 0.07, 6.5, trimMat, -0.883, 2.47, -5.15, { parent: store, cast: false });
+/* 落水管 */
+cyl(0.045, 0.045, 3.05, 8, darkMetalMat, -0.81, 1.72, -2.08);
+tube(new THREE.Vector3(-0.81, 0.22, -2.08), new THREE.Vector3(-0.6, 0.2, -2.08), 0.045, darkMetalMat);
+box(0.07, 0.05, 0.14, darkMetalMat, -0.86, 1.2, -2.08, { cast: false });
+box(0.07, 0.05, 0.14, darkMetalMat, -0.86, 2.3, -2.08, { cast: false });
+/* 电表箱 */
+box(0.11, 0.42, 0.32, toon(0x7c858b), -0.86, 1.95, -6.15, { outline: 1.04 });
+const meterDial = new THREE.Mesh(new THREE.CircleGeometry(0.07, 12), basic(0xd7e6e8));
+meterDial.rotation.y = Math.PI / 2;
+meterDial.position.set(-0.8, 2.02, -6.15);
+world.add(meterDial);
+
+/* 自动贩卖机 */
+const vendSideTex = canvasTex(320, 640, (ctx, w, h) => {
+  ctx.fillStyle = '#173746';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#6fd7ef';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(12, 12, w - 24, h - 24);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#eaf9ff';
+  ctx.font = '900 52px Arial';
+  ctx.fillText('COLD', w / 2, 96);
+  ctx.font = '700 25px Arial';
+  ctx.fillStyle = '#8ed8e8';
+  ctx.fillText('DRINKS', w / 2, 132);
+  /* 易拉罐 */
+  ctx.fillStyle = '#eef9fc';
+  ctx.beginPath();
+  ctx.roundRect(w / 2 - 58, 186, 116, 214, 18);
+  ctx.fill();
+  ctx.fillStyle = '#d95548';
+  ctx.beginPath();
+  ctx.roundRect(w / 2 - 44, 210, 88, 130, 12);
+  ctx.fill();
+  ctx.fillStyle = '#fff4e0';
+  ctx.fillRect(w / 2 - 36, 236, 72, 22);
+  ctx.fillStyle = '#c9a15c';
+  ctx.beginPath();
+  ctx.arc(w / 2, 322, 26, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '700 32px Arial';
+  ctx.fillText('¥130', w / 2, 372);
+  /* 雪花 */
+  ctx.strokeStyle = '#bfeefa';
+  ctx.lineWidth = 5;
+  for (let i = 0; i < 6; i++) {
+    const a = i / 6 * TAU;
+    ctx.beginPath();
+    ctx.moveTo(w / 2, 460);
+    ctx.lineTo(w / 2 + Math.cos(a) * 32, 460 + Math.sin(a) * 32);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#8ed8e8';
+  ctx.font = '700 22px Arial';
+  ctx.fillText('HOSHI MART', w / 2, 570);
+  ctx.fillStyle = '#4d9db4';
+  ctx.font = '600 18px Arial';
+  ctx.fillText('ICE COLD · 24H', w / 2, 604);
+});
+const vending = new THREE.Group();
+vending.position.set(-0.5, 0.16, -2.85);
+world.add(vending);
+box(0.7, 1.92, 1.0, toon(0xc2ced1), 0, 0.96, 0, { outline: 1.015, parent: vending });
+box(0.74, 0.08, 1.04, toon(0x304b5b), 0, 1.96, 0, { parent: vending, outline: 1.02 });
+box(0.72, 0.16, 1.02, toon(0x304b5b), 0, 0.08, 0, { parent: vending, cast: false });
+const vendSide = plane(0.62, 1.35, basic(0xffffff, { map: vendSideTex, toneMapped: false }), 0, 1.15, 0.505, { parent: vending });
+vendSide.renderOrder = 3;
+const vendFace = plane(0.92, 1.66, basic(0xffffff, { map: vendingTex, toneMapped: false }), 0.355, 1.0, 0, { parent: vending, ry: Math.PI / 2 });
+vendFace.renderOrder = 3;
+box(0.05, 0.2, 0.82, darkMetalMat, 0.36, 0.1, 0, { parent: vending, cast: false });
+const vendGlow = glow(0x9fe4ff, 1.8, 0.18);
+vendGlow.position.set(0.85, 1.22, -2.85);
+const vendLight = new THREE.PointLight(0x9fe4ff, 2.4, 3.8, 2);
+vendLight.position.set(0.25, 1.25, -2.85);
+scene.add(vendLight);
+
+/* 自行车 */
+const bike = new THREE.Group();
+bike.position.set(-0.5, 0.16, -4.65);
+bike.rotation.z = 0.055;
+world.add(bike);
+const bikeFrameMat = toon(0x6f9c98);
+const tireMat = toon(0x1c2128);
+const rimMat = toon(0xb8c1c8);
+function bikeWheel(z) {
+  const wg = new THREE.Group();
+  wg.position.set(0, 0.34, z);
+  const tire = new THREE.Mesh(new THREE.TorusGeometry(0.32, 0.024, 6, 24), tireMat);
+  tire.rotation.y = Math.PI / 2;
+  tire.castShadow = true;
+  wg.add(tire);
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(0.255, 0.01, 4, 24), rimMat);
+  rim.rotation.y = Math.PI / 2;
+  wg.add(rim);
+  for (let i = 0; i < 8; i++) {
+    const spoke = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.5, 4), rimMat);
+    spoke.rotation.x = i / 8 * Math.PI;
+    wg.add(spoke);
+  }
+  box(0.05, 0.05, 0.05, darkMetalMat, 0, 0, 0, { parent: wg, cast: false });
+  bike.add(wg);
+  return wg;
+}
+bikeWheel(-0.68);
+bikeWheel(0.62);
+/* 车架 */
+const pRear = new THREE.Vector3(0, 0.34, -0.68);
+const pFront = new THREE.Vector3(0, 0.34, 0.62);
+const pCrank = new THREE.Vector3(0, 0.36, -0.02);
+const pSeat = new THREE.Vector3(0, 0.82, -0.2);
+const pHead = new THREE.Vector3(0, 0.76, 0.4);
+tube(pRear, pCrank, 0.022, bikeFrameMat, bike);
+tube(pCrank, pSeat, 0.022, bikeFrameMat, bike);
+tube(pSeat, pRear, 0.022, bikeFrameMat, bike);
+tube(pSeat, pHead, 0.022, bikeFrameMat, bike);
+tube(pHead, pCrank, 0.022, bikeFrameMat, bike);
+tube(pHead, pFront, 0.02, bikeFrameMat, bike);
+tube(pHead, new THREE.Vector3(0, 0.98, 0.44), 0.018, bikeFrameMat, bike);
+/* 车把 & 座垫 */
+box(0.52, 0.035, 0.035, darkMetalMat, 0, 0.99, 0.44, { parent: bike, outline: 1.06 });
+box(0.2, 0.06, 0.32, toon(0x22262b), 0, 0.87, -0.2, { parent: bike, outline: 1.05 });
+/* 车篮 */
+for (let i = 0; i < 3; i++) {
+  box(0.34, 0.01, 0.05, toon(0xb9b2a2), 0, 0.78 + i * 0.11, 0.72, { parent: bike, cast: false });
+}
+box(0.34, 0.26, 0.01, toon(0xb9b2a2), 0, 0.88, 0.9, { parent: bike, cast: false });
+box(0.01, 0.26, 0.2, toon(0xb9b2a2), -0.17, 0.88, 0.8, { parent: bike, cast: false });
+box(0.01, 0.26, 0.2, toon(0xb9b2a2), 0.17, 0.88, 0.8, { parent: bike, cast: false });
+box(0.3, 0.02, 0.2, toon(0x8e8575), 0, 0.77, 0.8, { parent: bike, cast: false });
+/* 尾灯 */
+const bikeTail = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), basic(0xff4d4d, { toneMapped: false }));
+bikeTail.position.set(0, 0.38, -0.81);
+bike.add(bikeTail);
+/* 后货架 */
+box(0.24, 0.025, 0.34, darkMetalMat, 0, 0.64, -0.64, { parent: bike });
+
+/* 空调外机 */
+const fanSpinners = [];
+function addACUnit(x, y, z, scale = 1) {
+  const g = new THREE.Group();
+  g.position.set(x, y, z);
+  world.add(g);
+  box(0.36 * scale, 0.56 * scale, 0.78 * scale, toon(0xd4d6d1), 0, 0, 0, { outline: 1.02, parent: g });
+  box(0.38 * scale, 0.04 * scale, 0.8 * scale, toon(0x9aa0a2), 0, 0.28 * scale, 0, { parent: g, cast: false });
+  const grille = plane(0.54 * scale, 0.54 * scale, basic(0xffffff, { map: fanTex }), 0.185 * scale, 0, 0, { parent: g, ry: Math.PI / 2 });
+  const spin = plane(0.46 * scale, 0.46 * scale, basic(0xffffff, { map: bladeTex, transparent: true }), 0.175 * scale, 0, 0, { parent: g, ry: Math.PI / 2 });
+  fanSpinners.push(spin);
+  box(0.05 * scale, 0.5 * scale, 0.03 * scale, toon(0x6b7279), 0.2 * scale, 0, 0.36 * scale, { parent: g, cast: false });
+  return g;
+}
+addACUnit(-0.58, 0.44, -6.15, 1);
+addACUnit(-0.58, 0.44, -7.02, 0.9);
+/* 墙上管线 */
+cyl(0.025, 0.025, 2.9, 6, darkMetalMat, -0.8, 1.6, -6.55, { cast: false });
+tube(new THREE.Vector3(-0.8, 3.0, -6.55), new THREE.Vector3(-0.8, 3.0, -5.2), 0.025, darkMetalMat);
+
+/* 屋顶设备 */
+addACUnit(-5.9, 3.78, -6.4, 1.25);
+box(1.0, 0.42, 0.9, toon(0x777d80), -3.3, 3.62, -7.1, { outline: 1.02 });
+cyl(0.12, 0.14, 1.1, 10, darkMetalMat, -6.9, 3.95, -4.1, { outline: 1.04 });
+cyl(0.16, 0.16, 0.12, 10, darkMetalMat, -6.9, 4.52, -4.1);
+box(0.06, 1.7, 0.06, darkMetalMat, -2.2, 4.25, -6.4);
+box(0.6, 0.04, 0.04, darkMetalMat, -2.2, 4.95, -6.4);
+
+/* 电线杆 */
+const poleMat = toon(0x77746f);
+const poleArmMat = toon(0x4a4d52);
+function addUtilityPole(x, z, h) {
+  const g = new THREE.Group();
+  g.position.set(x, 0.16, z);
+  world.add(g);
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.115, h, 10), poleMat);
+  pole.position.y = h / 2;
+  pole.castShadow = true;
+  pole.receiveShadow = true;
+  g.add(pole);
+  const stripe = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.12, 0.14, 0.42, 10),
+    new THREE.MeshBasicMaterial({ map: stripeTex })
+  );
+  stripe.position.y = 0.34;
+  g.add(stripe);
+  /* 横担 */
+  box(1.55, 0.075, 0.075, poleArmMat, 0, h - 0.85, 0, { parent: g });
+  box(0.075, 0.075, 1.1, poleArmMat, 0, h - 1.45, 0, { parent: g });
+  /* 绝缘子 */
+  [-0.62, 0, 0.62].forEach((ox) => {
+    cyl(0.035, 0.045, 0.09, 6, toon(0xd9d5c8), ox, h - 0.77, 0, { parent: g, cast: false });
+  });
+  [-0.4, 0.4].forEach((oz) => {
+    cyl(0.03, 0.04, 0.08, 6, toon(0xd9d5c8), 0, h - 1.37, oz, { parent: g, cast: false });
+  });
+  /* 变压器 */
+  if (h > 7.3) {
+    cyl(0.2, 0.2, 0.65, 10, toon(0x696c6f), 0.26, h - 2.15, 0, { parent: g, outline: 1.03 });
+    box(0.12, 0.1, 0.12, darkMetalMat, 0.02, h - 2.52, 0, { parent: g });
+  }
+  /* 接线盒 */
+  box(0.2, 0.28, 0.16, darkMetalMat, 0.1, h - 3.3, 0.06, { parent: g, outline: 1.04 });
+  return g;
+}
+const poleA = addUtilityPole(-8.45, -0.75, 7.6);
+const poleB = addUtilityPole(6.5, -2.0, 7.25);
+const poleC = addUtilityPole(6.5, 6.3, 7.05);
+
+/* 路牌 */
+const signPlateMatA = basic(0xffffff, { map: streetSignTexA });
+const signPlateMatB = basic(0xffffff, { map: streetSignTexB });
+const signBoardA = plane(0.98, 0.245, signPlateMatA, -8.45, 3.55, -0.6, {});
+box(0.05, 0.05, 0.2, darkMetalMat, -8.45, 3.55, -0.73, { cast: false });
+plane(0.98, 0.245, basic(0xffffff, { map: streetSignTexA }), -8.45, 3.55, -0.62, { ry: Math.PI });
+const signBoardB = plane(0.98, 0.245, signPlateMatB, -8.28, 3.3, -0.75, { ry: Math.PI / 2 });
+plane(0.98, 0.245, basic(0xffffff, { map: streetSignTexB }), -8.28, 3.3, -0.75, { ry: -Math.PI / 2 });
+box(0.04, 0.04, 0.06, darkMetalMat, -8.35, 3.3, -0.75, { cast: false });
+
+/* 电线 */
+const wireMat = basic(0x263246);
+function wireSpan(a, b, sag, offset) {
+  const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
+  mid.y -= sag;
+  mid.x += offset;
+  const curve = new THREE.QuadraticBezierCurve3(a, mid, b);
+  const geo = new THREE.TubeGeometry(curve, 18, 0.014, 3, false);
+  const m = new THREE.Mesh(geo, wireMat);
+  m.castShadow = false;
+  world.add(m);
+}
+const topA = new THREE.Vector3(-8.45, 7.45, -0.75);
+const topB = new THREE.Vector3(6.5, 7.05, -2.0);
+const topC = new THREE.Vector3(6.5, 6.85, 6.3);
+for (let i = 0; i < 3; i++) wireSpan(topA.clone().add(new THREE.Vector3(-0.55 + i * 0.55, 0, 0)), topB.clone().add(new THREE.Vector3(-0.55 + i * 0.55, 0, 0)), 0.42, 0);
+for (let i = 0; i < 3; i++) wireSpan(topB.clone().add(new THREE.Vector3(0, 0, -0.55 + i * 0.55)), topC.clone().add(new THREE.Vector3(0, 0, -0.55 + i * 0.55)), 0.4, 0);
+
+/* 路灯 */
+cyl(0.05, 0.06, 0.7, 8, darkMetalMat, -8.45, 5.32, -0.35, { rx: Math.PI / 2, cast: false });
+tube(new THREE.Vector3(-8.45, 5.42, -0.5), new THREE.Vector3(-8.45, 5.52, 0.9), 0.045, darkMetalMat);
+{
+  const lampHead = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.23, 0.18, 12), darkMetalMat);
+  lampHead.position.set(-8.45, 5.42, 1.25);
+  lampHead.castShadow = true;
+  world.add(lampHead);
+  const lampDisc = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.19, 0.02, 16), basic(0xffd7a0, { toneMapped: false }));
+  lampDisc.position.set(-8.45, 5.32, 1.25);
+  world.add(lampDisc);
+  const lampGlow = glow(0xffbd7a, 2.8, 0.5);
+  lampGlow.position.set(-8.45, 5.2, 1.25);
+  const lampLight = new THREE.PointLight(0xffb671, 34, 15, 2);
+  lampLight.position.set(-8.45, 4.82, 1.25);
+  scene.add(lampLight);
+}
+
+/* 地面标牌 P */
+const pSignGroup = new THREE.Group();
+pSignGroup.position.set(5.85, 0.16, -5.9);
+world.add(pSignGroup);
+cyl(0.035, 0.045, 2.2, 8, darkMetalMat, 0, 1.1, 0, { parent: pSignGroup });
+box(0.06, 0.7, 0.9, trimMat, 0, 2.0, 0, { parent: pSignGroup, outline: 1.03 });
+plane(0.86, 0.64, basic(0xffffff, { map: pSignTex }), 0.035, 2.0, 0, { parent: pSignGroup, ry: Math.PI / 2 });
+plane(0.86, 0.64, basic(0xffffff, { map: pSignTex }), -0.035, 2.0, 0, { parent: pSignGroup, ry: -Math.PI / 2 });
+
+/* 护栏 */
+const railMat = toon(0xdfe3e2);
+function guardRail(x1, x2, z, alongX = true) {
+  const g = new THREE.Group();
+  world.add(g);
+  const len = alongX ? x2 - x1 : x2 - x1;
+  const steps = Math.max(2, Math.round(len / 1.7));
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const px = alongX ? x1 + (x2 - x1) * t : x1;
+    const pz = alongX ? z : x1 + (x2 - x1) * t;
+    cyl(0.035, 0.04, 0.88, 8, railMat, px, 0.16 + 0.44, pz, { parent: g, outline: 1.05 });
+    /* 反光片 */
+    const ref = new THREE.Mesh(new THREE.SphereGeometry(0.035, 6, 6), basic(0xff9c48, { toneMapped: false }));
+    ref.position.set(px, 0.16 + 0.58, pz + (alongX ? 0.045 : 0.045));
+    g.add(ref);
+  }
+  const y1 = 0.16 + 0.72, y2 = 0.16 + 0.9;
+  if (alongX) {
+    tube(new THREE.Vector3(x1, y1, z), new THREE.Vector3(x2, y1, z), 0.04, railMat, g, 8);
+    tube(new THREE.Vector3(x1, y2, z), new THREE.Vector3(x2, y2, z), 0.04, railMat, g, 8);
+  } else {
+    tube(new THREE.Vector3(x1, y1, x2), new THREE.Vector3(x1, y1, x2), 0.04, railMat, g);
+  }
+  return g;
+}
+guardRail(-8.6, -3.45, 5.58, true);
+guardRail(0.85, 5.05, 5.58, true);
+
+/* 交通灯（架在转角电线杆上） */
+const traffic = new THREE.Group();
+traffic.position.set(6.5, 0.16, 6.3);
+traffic.scale.setScalar(0.95);
+world.add(traffic);
+cyl(0.07, 0.09, 4.9, 10, toon(0x595f63), 0, 2.45, 0, { parent: traffic, outline: 1.03 });
+box(0.09, 0.09, 1.45, toon(0x595f63), 0, 4.5, -0.67, { parent: traffic, cast: true });
+const headG = new THREE.Group();
+headG.position.set(0, 4.18, -1.15);
+traffic.add(headG);
+box(1.2, 0.4, 0.24, toon(0x272d33), 0, 0, 0, { outline: 1.02, parent: headG });
+box(1.26, 0.06, 0.3, toon(0x1b2025), 0, 0.23, 0, { parent: headG });
+const lensMats = [];
+const lensSprites = [];
+['red', 'yellow', 'green'].forEach((name, i) => {
+  const mat = basic(0x2a1717, { toneMapped: false });
+  const lens = new THREE.Mesh(new THREE.CircleGeometry(0.115, 16), mat);
+  lens.position.set(-0.36 + i * 0.36, 0, 0.125);
+  headG.add(lens);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.014, 4, 16), toon(0x3e464e));
+  ring.position.set(-0.36 + i * 0.36, 0, 0.13);
+  headG.add(ring);
+  const s = glow(name === 'red' ? 0xff514d : name === 'yellow' ? 0xffcc4d : 0x57ffb3, 0.8, 0);
+  s.position.set(-0.36 + i * 0.36, 0, 0.2);
+  headG.add(s);
+  lensMats.push(mat);
+  lensSprites.push(s);
+  /* 遮阳板 */
+  box(0.28, 0.03, 0.22, toon(0x20252a), -0.36 + i * 0.36, 0.145, 0.03, { parent: headG, cast: false });
+});
+/* 行人信号灯 */
+const pedGroup = new THREE.Group();
+pedGroup.position.set(0, 2.55, 0.09);
+traffic.add(pedGroup);
+box(0.34, 0.72, 0.28, toon(0x272d33), 0, 0, 0, { outline: 1.03, parent: pedGroup });
+const pedRed = new THREE.Mesh(new THREE.CircleGeometry(0.085, 14), basic(0x2a1717, { toneMapped: false }));
+pedRed.position.set(0, 0.17, 0.15);
+pedGroup.add(pedRed);
+const pedGreen = new THREE.Mesh(new THREE.CircleGeometry(0.085, 14), basic(0x142a20, { toneMapped: false }));
+pedGreen.position.set(0, -0.17, 0.15);
+pedGroup.add(pedGreen);
+const pedRedGlow = glow(0xff514d, 0.55, 0);
+pedRedGlow.position.set(0, 0.17, 0.25);
+pedGroup.add(pedRedGlow);
+const pedGreenGlow = glow(0x59ffb2, 0.55, 0);
+pedGreenGlow.position.set(0, -0.17, 0.25);
+pedGroup.add(pedGreenGlow);
+box(0.5, 0.28, 0.22, toon(0x353b40), 0, 1.25, 0.08, { parent: traffic, cast: false });
+pedGroup.visible = false;
+
+/* 垃圾桶与伞架 */
+const trashG = new THREE.Group();
+trashG.position.set(-2.5, 0.16, -1.33);
+world.add(trashG);
+[0, 0.46].forEach((ox, i) => {
+  cyl(0.2, 0.21, 0.62, 12, toon(i ? 0x4f7f86 : 0x6c7682), ox, 0.31, 0, { outline: 1.04, parent: trashG });
+  cyl(0.22, 0.22, 0.06, 12, darkMetalMat, ox, 0.64, 0, { parent: trashG });
+  box(0.16, 0.05, 0.03, basic(0xf4efe2), ox, 0.4, 0.21, { parent: trashG, cast: false });
+});
+box(0.9, 0.05, 0.4, darkMetalMat, 0.23, 0.05, 0, { parent: trashG });
+
+const umbrellaG = new THREE.Group();
+umbrellaG.position.set(-4.95, 0.16, -1.36);
+world.add(umbrellaG);
+cyl(0.19, 0.23, 0.58, 12, toon(0x3f5862), 0, 0.29, 0, { outline: 1.04, parent: umbrellaG });
+cyl(0.21, 0.21, 0.05, 12, darkMetalMat, 0, 0.56, 0, { parent: umbrellaG, cast: false });
+const umbrellaCols = [0x315c8b, 0xe0d7c6, 0xb85a6a];
+umbrellaCols.forEach((c, i) => {
+  const a = i / 3 * TAU + 0.4;
+  const x = Math.cos(a) * 0.08, z = Math.sin(a) * 0.08;
+  cyl(0.018, 0.018, 0.85, 6, darkMetalMat, x, 0.86, z, { parent: umbrellaG, rz: Math.cos(a) * 0.11, rx: Math.sin(a) * 0.11 });
+  const top = new THREE.Mesh(new THREE.ConeGeometry(0.075, 0.52, 6), toon(c));
+  top.position.set(x * 1.8, 0.8, z * 1.8);
+  top.rotation.z = Math.cos(a) * 0.1;
+  top.rotation.x = Math.sin(a) * 0.1;
+  umbrellaG.add(top);
+});
+
+/* 小巷 */
+const alleyLamp = new THREE.Group();
+alleyLamp.position.set(-7.87, 2.25, -3.55);
+world.add(alleyLamp);
+box(0.1, 0.22, 0.16, darkMetalMat, 0.03, 0, 0, { parent: alleyLamp });
+const alleyBulb = new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 8), basic(0xffca88, { toneMapped: false }));
+alleyBulb.position.set(-0.04, 0, 0);
+alleyLamp.add(alleyBulb);
+const alleyGlow = glow(0xffb66e, 1.1, 0.35);
+alleyGlow.position.set(-8.1, 2.22, -3.55);
+const alleyLight = new THREE.PointLight(0xffb166, 4, 4, 2);
+alleyLight.position.set(-8.5, 2.1, -3.7);
+scene.add(alleyLight);
+/* 啤酒箱 */
+const crateCols = [0xc1523f, 0x3c5d86, 0xb28a3b];
+for (let i = 0; i < 5; i++) {
+  box(0.46, 0.3, 0.46, toon(crateCols[i % 3]), -8.48 + (i % 2) * 0.16, 0.16 + Math.floor(i / 3) * 0.31 + 0.15, -7.5 - (i % 2) * 0.5, { outline: 1.03 });
+}
+/* 管子 */
+cyl(0.035, 0.035, 3.0, 6, darkMetalMat, -7.88, 1.66, -5.9, { cast: false });
+cyl(0.035, 0.035, 3.0, 6, darkMetalMat, -7.88, 1.66, -6.1, { cast: false });
+/* 小巷木栅栏 */
+const fenceMat = toon(0x5b4a3b);
+for (let i = 0; i < 6; i++) {
+  box(0.16, 1.3, 0.08, fenceMat, -8.95 + i * 0.19, 0.16 + 0.65, -8.82, { outline: 1.03 });
+}
+box(1.2, 0.08, 0.06, fenceMat, -8.5, 0.16 + 1.05, -8.82);
+box(1.2, 0.08, 0.06, fenceMat, -8.5, 0.16 + 0.42, -8.82);
+
+/* 植被盒 / 树 */
+const hedgeBoxMat = toon(0x1f3d31);
+const hedgeClumpMat = toon(0x2c5340);
+function hedgeSegment(x, z, w, d) {
+  const g = new THREE.Group();
+  world.add(g);
+  box(w, 0.28, d, toon(0x4c4a42), x, 0.16 + 0.14, z, { parent: g, cast: false });
+  const hh = rand(0.55, 0.75);
+  box(w, hh, d * 0.9, hedgeBoxMat, x, 0.16 + 0.28 + hh / 2, z, { parent: g, outline: 1.005 });
+  for (let i = 0; i < 3; i++) {
+    const clump = new THREE.Mesh(new THREE.IcosahedronGeometry(rand(0.25, 0.45), 0), hedgeClumpMat);
+    clump.position.set(x + rand(-w / 3, w / 3), 0.16 + 0.28 + hh + rand(-0.15, 0.1), z + rand(-d / 3, d / 3));
+    clump.scale.y = 0.7;
+    clump.castShadow = true;
+    g.add(clump);
+  }
+}
+for (let x = -8.5; x < 7.0; x += 3.1) {
+  if (Math.abs(x + 1) < 2.4) continue;
+  hedgeSegment(x, 8.25, 2.55, 1.05);
+}
+for (let z = -8.5; z < 5.1; z += 3.1) {
+  hedgeSegment(8.25, z, 1.05, 2.55);
+}
+function tree(x, z, h) {
+  const g = new THREE.Group();
+  g.position.set(x, 0.16, z);
+  world.add(g);
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.14, h * 0.55, 7), toon(0x3c332c));
+  trunk.position.y = h * 0.275;
+  trunk.castShadow = true;
+  g.add(trunk);
+  for (let i = 0; i < 3; i++) {
+    const c = new THREE.Mesh(new THREE.IcosahedronGeometry(rand(0.7, 1.0) * h * 0.22, 0), i === 0 ? toon(0x254636) : toon(0x1e3a2d));
+    c.position.set(rand(-0.35, 0.35), h * 0.58 + i * h * 0.13, rand(-0.3, 0.3));
+    c.scale.set(1.15, 0.85, 1.15);
+    c.castShadow = true;
+    g.add(c);
+  }
+}
+tree(-6.8, 8.05, 3.9);
+tree(8.15, 1.8, 4.1);
+
+/* 落叶 */
+const leafMat = toon(0x3d5a3a);
+const leafGeo = new THREE.CircleGeometry(0.075, 5);
+for (let i = 0; i < 9; i++) {
+  const leaf = new THREE.Mesh(leafGeo, leafMat);
+  leaf.rotation.x = -Math.PI / 2;
+  leaf.rotation.z = rand(0, TAU);
+  leaf.scale.set(rand(0.5, 1.1), rand(1, 1.8), 1);
+  leaf.position.set(rand(-7.5, -1.2), 0.174, rand(-1.3, -0.6));
+  world.add(leaf);
+}
+/* 空罐 */
+const can = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.055, 0.15, 8), toon(0x6d7d86));
+can.position.set(-1.9, 0.235, -0.75);
+can.rotation.z = Math.PI / 2;
+world.add(can);
+
+/* ============================================================
+   雨夜：湿地反射 / 积水 / 雨 / 涟漪 / 滴水 / 蒸汽
+   ============================================================ */
+const poolTex = canvasTex(256, 256, (ctx, w, h) => {
+  const g = ctx.createRadialGradient(128, 128, 2, 128, 128, 124);
+  g.addColorStop(0, 'rgba(255,255,255,.95)');
+  g.addColorStop(0.32, 'rgba(255,255,255,.42)');
+  g.addColorStop(0.7, 'rgba(255,255,255,.09)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+});
+
+const streakTex = canvasTex(128, 512, (ctx, w, h) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(w * 0.22, 0, w * 0.56, h);
+  ctx.globalCompositeOperation = 'destination-in';
+  let g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(0.07, 'rgba(0,0,0,1)');
+  g.addColorStop(0.32, 'rgba(0,0,0,.6)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  g = ctx.createLinearGradient(0, 0, w, 0);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(0.32, 'rgba(0,0,0,.9)');
+  g.addColorStop(0.68, 'rgba(0,0,0,.9)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+});
+
+const reflectionMats = [];
+function wetPool(x, z, w, d, color, opacity, y = 0.027) {
+  const mat = new THREE.MeshBasicMaterial({
+    map: poolTex, color, transparent: true, opacity,
+    blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide
+  });
+  const m = plane(w, d, mat, x, y, z, { rx: -Math.PI / 2 });
+  m.renderOrder = 2;
+  reflectionMats.push({ mat, base: opacity, phase: rand(0, TAU), speed: rand(0.7, 1.4) });
+  return m;
+}
+function wetStreak(x, z, w, d, color, opacity, spin = 0, y = 0.029) {
+  const mat = new THREE.MeshBasicMaterial({
+    map: streakTex, color, transparent: true, opacity,
+    blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide
+  });
+  const m = plane(w, d, mat, x, y, z, { rx: -Math.PI / 2 });
+  m.rotation.set(-Math.PI / 2, 0, spin);
+  m.renderOrder = 2;
+  reflectionMats.push({ mat, base: opacity, phase: rand(0, TAU), speed: rand(0.8, 1.7) });
+  return m;
+}
+/* 店面暖光倒影 */
+wetPool(-4.3, -1.15, 6.9, 1.3, 0xffc57d, 0.22, 0.174);
+wetStreak(-4.4, 1.35, 6.8, 3.8, 0xffc785, 0.17);
+wetStreak(-6.1, 1.1, 0.7, 3.0, 0x7bb8ff, 0.1);
+wetStreak(-4.5, 1.15, 0.55, 3.2, 0xfff1c9, 0.12);
+wetStreak(-2.9, 1.1, 0.5, 2.8, 0x7fffd4, 0.07);
+/* 贩卖机冷光 */
+wetStreak(1.1, -2.85, 2.9, 1.25, 0xa8edff, 0.22, Math.PI / 2);
+wetPool(0.15, -2.85, 1.7, 1.0, 0xa8edff, 0.16, 0.174);
+/* 路灯暖光 */
+wetStreak(-8.45, 3.0, 2.4, 4.0, 0xffbf7c, 0.16);
+/* 信号灯映光 */
+const trafficPoolMat = new THREE.MeshBasicMaterial({
+  map: poolTex, color: 0x66ffb5, transparent: true, opacity: 0.13,
+  blending: THREE.AdditiveBlending, depthWrite: false
+});
+const trafficPool = plane(1.5, 2.1, trafficPoolMat, 6.5, 0.03, 3.8, { rx: -Math.PI / 2 });
+trafficPool.renderOrder = 2;
+
+/* 积水 */
+const puddleAlphaTex = canvasTex(256, 256, (ctx, w, h) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.filter = 'blur(10px)';
+  ctx.fillStyle = '#fff';
+  const blob = (x, y, rx, ry, rot) => {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, rx, ry, 0, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  };
+  blob(128, 128, 78, 58, 0.2);
+  blob(88, 116, 36, 28, -0.4);
+  blob(166, 142, 42, 30, 0.5);
+  blob(140, 88, 30, 22, 0.1);
+  ctx.filter = 'none';
+}, { linear: true });
+const puddleMat = new THREE.MeshStandardMaterial({
+  color: 0x1b3447, roughness: 0.035, metalness: 0.98, envMapIntensity: 2.4,
+  transparent: true, alphaMap: puddleAlphaTex, opacity: 0.62, depthWrite: false
+});
+const puddleSpots = [];
+function addPuddle(x, z, rx, rz, y = 0.026, rot = rand(0, TAU)) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), puddleMat);
+  m.rotation.set(-Math.PI / 2, 0, rot);
+  m.scale.set(rx, rz, 1);
+  m.position.set(x, y, z);
+  m.renderOrder = 1;
+  m.receiveShadow = false;
+  world.add(m);
+  puddleSpots.push({ x, z, y });
+}
+addPuddle(2.2, 2.6, 2.7, 1.7, 0.026, 0.5);
+addPuddle(-2.3, 4.1, 2.1, 1.2, 0.026, -0.4);
+addPuddle(4.2, 0.2, 1.7, 1.1, 0.026, 0.2);
+addPuddle(0.2, -0.85, 1.3, 0.7, 0.174, 0.1);
+addPuddle(-6.3, -0.88, 1.6, 0.6, 0.174, -0.3);
+addPuddle(-8.4, -4.8, 1.0, 1.8, 0.174, 0.7);
+addPuddle(6.6, 6.6, 1.4, 1.0, 0.174, 0.4);
+
+/* 雨 */
+const RAIN_COUNT = 1800;
+const rainPositions = new Float32Array(RAIN_COUNT * 6);
+const rainDrops = [];
+const rainGeo = new THREE.BufferGeometry();
+rainGeo.setAttribute('position', new THREE.BufferAttribute(rainPositions, 3));
+const rainMat = new THREE.LineBasicMaterial({
+  color: 0x93b6d4, transparent: true, opacity: 0.2, depthWrite: false
+});
+const rain = new THREE.LineSegments(rainGeo, rainMat);
+rain.frustumCulled = false;
+scene.add(rain);
+function resetDrop(d, initial = false) {
+  d.x = rand(-9.6, 9.6);
+  d.z = rand(-9.6, 9.6);
+  d.y = initial ? rand(0.2, 13.4) : rand(11.2, 13.6);
+  d.speed = rand(11, 18);
+  d.len = rand(0.16, 0.38);
+  d.drift = rand(-0.25, 0.25);
+}
+for (let i = 0; i < RAIN_COUNT; i++) {
+  const d = {};
+  resetDrop(d, true);
+  rainDrops.push(d);
+}
+function rainBlocked(x, z, y) {
+  if (x > -7.95 && x < -0.85 && z > -8.45 && z < -1.85 && y < 3.56) return true;
+  if (x > -7.95 && x < -0.85 && z > -2.0 && z < -0.42 && y < 2.53) return true;
+  return false;
+}
+onUpdate((dt, t) => {
+  for (let i = 0; i < RAIN_COUNT; i++) {
+    const d = rainDrops[i];
+    d.y -= d.speed * dt;
+    d.x += (0.7 + d.drift) * dt;
+    d.z += 0.22 * dt;
+    if (d.y < 0.03 || d.x > 9.8 || rainBlocked(d.x, d.z, d.y)) {
+      resetDrop(d, false);
+    }
+    const o = i * 6;
+    rainPositions[o] = d.x;
+    rainPositions[o + 1] = d.y;
+    rainPositions[o + 2] = d.z;
+    rainPositions[o + 3] = d.x + 0.035;
+    rainPositions[o + 4] = d.y + d.len;
+    rainPositions[o + 5] = d.z + 0.012;
+  }
+  rainGeo.attributes.position.needsUpdate = true;
+});
+
+/* 涟漪 */
+const rippleGeo = new THREE.RingGeometry(0.34, 0.5, 22);
+const ripples = [];
+for (let i = 0; i < 44; i++) {
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xb7ddf3, transparent: true, opacity: 0,
+    blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide
+  });
+  const m = new THREE.Mesh(rippleGeo, mat);
+  m.rotation.x = -Math.PI / 2;
+  m.visible = false;
+  m.renderOrder = 3;
+  world.add(m);
+  ripples.push({ mesh: m, mat, active: false, life: 0, dur: 1, max: 0.5 });
+}
+function spawnRipple(x, z, y, max = 0.5) {
+  const r = ripples.find((r) => !r.active);
+  if (!r) return;
+  r.active = true;
+  r.life = 0;
+  r.dur = rand(0.85, 1.35);
+  r.max = max;
+  r.mesh.position.set(x, y, z);
+  r.mesh.scale.setScalar(0.14);
+  r.mat.opacity = 0;
+  r.mesh.visible = true;
+}
+function randomWetSpot() {
+  if (Math.random() < 0.58) {
+    let x = rand(-8.7, 8.7), z = rand(-8.7, 8.7);
+    if (x > -7.95 && x < -0.85 && z > -8.45 && z < -1.85) return randomWetSpot();
+    const y = (z > 5.4 || x > 5.4) ? 0.176 : (x < 0.9 && z < -0.5 ? 0.176 : 0.032);
+    return { x, z, y };
+  }
+  const p = pick(puddleSpots);
+  return { x: p.x + rand(-0.28, 0.28), z: p.z + rand(-0.24, 0.24), y: p.y + 0.004 };
+}
+let rippleTimer = 0;
+onUpdate((dt, t) => {
+  for (const r of ripples) {
+    if (!r.active) continue;
+    r.life += dt;
+    const k = r.life / r.dur;
+    if (k >= 1) {
+      r.active = false;
+      r.mesh.visible = false;
+      continue;
+    }
+    const s = 0.14 + k * r.max;
+    r.mesh.scale.setScalar(s);
+    r.mat.opacity = 0.34 * (1 - k) * (1 - k);
+  }
+  rippleTimer -= dt;
+  if (rippleTimer <= 0) {
+    const p = randomWetSpot();
+    spawnRipple(p.x, p.z, p.y, rand(0.28, 0.55));
+    rippleTimer = rand(0.035, 0.075);
+  }
+});
+
+/* 雨棚滴水 */
+const dripGeo = new THREE.SphereGeometry(0.024, 6, 6);
+const dripMat = new THREE.MeshBasicMaterial({ color: 0xcce9ff, transparent: true, opacity: 0.82 });
+const drips = [];
+[-7.15, -5.45, -3.7, -1.55].forEach((x) => {
+  const m = new THREE.Mesh(dripGeo, dripMat);
+  m.visible = false;
+  world.add(m);
+  drips.push({ x, z: -0.55, mesh: m, active: false, y: 2.33, vy: 0, wait: rand(0.4, 2.4) });
+});
+onUpdate((dt, t) => {
+  for (const d of drips) {
+    if (!d.active) {
+      d.wait -= dt;
+      if (d.wait <= 0) {
+        d.active = true;
+        d.y = 2.38;
+        d.vy = -0.15;
+        d.mesh.visible = true;
+        d.mesh.position.set(d.x, d.y, d.z);
+      }
+      continue;
+    }
+    d.vy -= 9.8 * dt;
+    d.y += d.vy * dt;
+    d.mesh.position.y = d.y;
+    if (d.y <= 0.19) {
+      spawnRipple(d.x, d.z, 0.185, rand(0.16, 0.28));
+      d.active = false;
+      d.mesh.visible = false;
+      d.wait = rand(0.9, 3.0);
+    }
+  }
+});
+
+/* 玻璃上的雨珠 */
+const glassDropGeo = new THREE.SphereGeometry(0.013, 6, 6);
+const glassDropMat = new THREE.MeshBasicMaterial({ color: 0xd2eaff, transparent: true, opacity: 0.55 });
+const glassDrops = [];
+for (let i = 0; i < 30; i++) {
+  const left = Math.random() < 0.64;
+  const x = left ? rand(-7.6, -4.7) : rand(-2.85, -1.15);
+  const y = rand(0.7, 2.38);
+  const mesh = new THREE.Mesh(glassDropGeo, glassDropMat);
+  mesh.scale.set(1, rand(1.8, 3.6), 0.7);
+  mesh.position.set(x, y, -1.848);
+  mesh.renderOrder = 9;
+  world.add(mesh);
+  glassDrops.push({ mesh, baseX: x, y, speed: rand(0.035, 0.13), phase: rand(0, TAU), still: Math.random() < 0.18 });
+}
+onUpdate((dt, t) => {
+  for (const d of glassDrops) {
+    if (!d.still) {
+      d.y -= d.speed * dt;
+      if (d.y < 0.62) {
+        d.y = 2.4;
+        d.baseX = (Math.random() < 0.64) ? rand(-7.6, -4.7) : rand(-2.85, -1.15);
+        d.speed = rand(0.035, 0.14);
+      }
+    }
+    d.mesh.position.y = d.y;
+    d.mesh.position.x = d.baseX + Math.sin(t * 0.55 + d.phase) * 0.008;
+  }
+});
+
+/* 关东煮蒸汽 */
+const steamSprites = [];
+for (let i = 0; i < 8; i++) {
+  const mat = new THREE.SpriteMaterial({
+    map: glowTexture, color: 0xfff4e2, transparent: true, opacity: 0.09,
+    depthWrite: false, blending: THREE.AdditiveBlending
+  });
+  const s = new THREE.Sprite(mat);
+  s.scale.set(0.4, 0.4, 1);
+  s.position.set(-1.62 + rand(-0.16, 0.16), 1.6 + rand(0, 0.5), -4.86 + rand(-0.16, 0.16));
+  store.add(s);
+  steamSprites.push({ s, baseY: s.position.y, phase: rand(0, TAU), speed: rand(0.16, 0.3), life: rand(0, 1) });
+}
+onUpdate((dt, t) => {
+  for (const st of steamSprites) {
+    st.life += dt * st.speed;
+    if (st.life > 1) {
+      st.life = 0;
+      st.s.position.set(-1.62 + rand(-0.16, 0.16), 1.6, -4.86 + rand(-0.16, 0.16));
+    }
+    st.s.position.y = 1.6 + st.life * 0.9;
+    st.s.material.opacity = 0.09 * Math.sin(st.life * Math.PI);
+    st.s.scale.setScalar(0.28 + st.life * 0.4);
+  }
+});
+
+/* 交通灯循环 */
+const SIGNAL_DIM = 0x221b1a;
+const signalCols = [0xe8473f, 0xe6b545, 0x4de0a0];
+onUpdate((dt, t) => {
+  const cyc = t % 27;
+  let state = 0;
+  if (cyc >= 10 && cyc < 12.4) state = 1;
+  else if (cyc >= 12.4) state = 2;
+  for (let i = 0; i < 3; i++) {
+    const on = (state === 0 && i === 2) || (state === 1 && i === 1) || (state === 2 && i === 0);
+    lensMats[i].color.setHex(on ? signalCols[i] : SIGNAL_DIM);
+    lensSprites[i].material.opacity = on ? 0.38 : 0;
+  }
+  const walk = cyc > 14 && cyc < 24;
+  const blink = cyc > 22 ? Math.sin(t * 16) > 0 : true;
+  pedGreen.material.color.setHex(walk && blink ? 0x5dffb5 : 0x142a20);
+  pedGreenGlow.material.opacity = walk && blink ? 0.4 : 0;
+  pedRed.material.color.setHex(!walk ? 0xff5048 : 0x2a1717);
+  pedRedGlow.material.opacity = !walk ? 0.4 : 0;
+  trafficPoolMat.color.setHex(state === 2 ? 0xe8473f : state === 1 ? 0xe6b545 : 0x4de0a0);
+  trafficPoolMat.opacity = 0.07 + 0.02 * Math.sin(t * 2.0);
+});
+
+/* 反光微微流动 + 空调风扇 */
+onUpdate((dt, t) => {
+  for (const r of reflectionMats) {
+    r.mat.opacity = r.base * (0.9 + 0.1 * Math.sin(t * r.speed + r.phase));
+  }
+  fanSpinners.forEach((f, i) => {
+    f.rotation.z = t * (3.2 + i * 0.4);
+  });
+});
+
+/* 招牌反光细碎闪烁 */
+onUpdate((dt, t) => {
+  const v = 0.92 + 0.08 * Math.sin(t * 2.7) * Math.sin(t * 7.1);
+  vendGlow.material.opacity = 0.32 + 0.06 * v;
+});
+
+/* 实例化商品 */
+(function flushInstances() {
+  const dummy = new THREE.Object3D();
+  const color = new THREE.Color();
+
+  const pGeo = new THREE.BoxGeometry(1, 1, 1);
+  const pMesh = new THREE.InstancedMesh(pGeo, toon(0xffffff), productInstances.length);
+  productInstances.forEach((p, i) => {
+    dummy.position.set(p.x, p.y, p.z);
+    dummy.rotation.set(0, p.ry || 0, 0);
+    dummy.scale.set(p.sx, p.sy, p.sz);
+    dummy.updateMatrix();
+    pMesh.setMatrixAt(i, dummy.matrix);
+    pMesh.setColorAt(i, color.setHex(p.color));
+  });
+  pMesh.instanceMatrix.needsUpdate = true;
+  if (pMesh.instanceColor) pMesh.instanceColor.needsUpdate = true;
+  pMesh.castShadow = false;
+  pMesh.receiveShadow = false;
+  store.add(pMesh);
+
+  const bGeo = new THREE.CylinderGeometry(0.032, 0.04, 0.21, 6);
+  const bMesh = new THREE.InstancedMesh(bGeo, toon(0xffffff), bottleInstances.length);
+  bottleInstances.forEach((b, i) => {
+    dummy.position.set(b.x, b.y, b.z);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    bMesh.setMatrixAt(i, dummy.matrix);
+    bMesh.setColorAt(i, color.setHex(b.color));
+  });
+  bMesh.instanceMatrix.needsUpdate = true;
+  if (bMesh.instanceColor) bMesh.instanceColor.needsUpdate = true;
+  bMesh.castShadow = false;
+  bMesh.receiveShadow = false;
+  store.add(bMesh);
+})();
+
+/* ============================================================
+   后期
+   ============================================================ */
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.34, 0.26, 0.88);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+/* ============================================================
+   动效
+   ============================================================ */
+const easeInOut = (x) => x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2;
+
+onUpdate((dt, t) => {
+  /* 自动门 */
+  const cyc = t % 17;
+  let open = 0;
+  if (cyc > 5.5 && cyc < 11.8) {
+    const p = cyc - 5.5;
+    if (p < 1.2) open = easeInOut(p / 1.2);
+    else if (p < 4.0) open = 1;
+    else open = 1 - easeInOut(Math.min(1, (p - 4.0) / 1.5));
+  }
+  doorL.position.x = -4.16 - 0.78 * open;
+  doorR.position.x = -3.34 + 0.78 * open;
+  sensorLED.material.color.setHex(Math.sin(t * 1.8) > 0 ? 0x6dff9e : 0xff5544);
+
+  /* 招牌轻微闪烁 */
+  const ph = t % 21.5;
+  let flick = 1;
+  if (ph > 18.6 && ph < 18.72) flick = 0.55 + Math.random() * 0.2;
+  else if (ph > 18.9 && ph < 18.96) flick = 0.72;
+  storeSignMat.color.setScalar((0.95 + 0.03 * Math.sin(t * 21.0)) * flick);
+  signGlow.material.opacity = 0.13 * flick;
+
+  const ph2 = (t + 4.2) % 27.0;
+  let flick2 = 1;
+  if (ph2 > 24.1 && ph2 < 24.26) flick2 = 0.4;
+  else if (ph2 > 24.4 && ph2 < 24.52) flick2 = 0.7;
+  projMat.color.setScalar((0.94 + 0.04 * Math.sin(t * 13.3)) * flick2);
+  projGlow.material.opacity = 0.22 * flick2;
+});
+
+/* ============================================================
+   尺寸 / 循环
+   ============================================================ */
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  controls.update();
+  for (let i = 0; i < updaters.length; i++) updaters[i](dt, t);
+  composer.render();
+});
+</script>
+</body>
+</html>
