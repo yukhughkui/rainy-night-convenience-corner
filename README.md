@@ -1,12 +1,15 @@
 # 雨夜便利店街角 · 微缩 3D 场景
 
-一个单文件、可离线运行的雨夜日式便利店街角微缩三维模型。采用三渲二（toon-shaded）卡通渲染，浓厚的二次元动画夜晚氛围，可通过鼠标自由拖拽、旋转、缩放观察整个场景。
+同一命题下的**模型测试对照**：两个模型分别生成的单文件、可离线运行的雨夜日式便利店街角微缩三维模型。采用三渲二（toon-shaded）卡通渲染，浓厚的二次元动画夜晚氛围，可通过鼠标自由拖拽、旋转、缩放观察整个场景。
 
 ## 在线预览
 
-👉 **https://yukhughkui.github.io/rainy-night-convenience-corner/**
+| 版本 | 生成来源 | 在线预览 | 源文件 |
+| --- | --- | --- | --- |
+| 版本 A（首页） | 混元 3 | 👉 **https://yukhughkui.github.io/rainy-night-convenience-corner/** | [`index.html`](./index.html) |
+| 版本 B | Hy4 | 👉 **https://yukhughkui.github.io/rainy-night-convenience-corner/hy4.html** | [`hy4.html`](./hy4.html) |
 
-（GitHub Pages 托管，浏览器直接打开即可。可拖拽旋转、滚轮缩放、右键平移。）
+（GitHub Pages 托管，浏览器直接打开即可。可拖拽旋转、滚轮缩放、右键平移。两个版本均为单文件、零外部依赖，可离线运行。）
 
 ## 仓库地址
 
@@ -23,31 +26,32 @@ https://github.com/yukhughkui/rainy-night-convenience-corner
 
 - 纯前端 **Three.js**（WebGL），全部内联打包进单个 HTML，**零外部依赖、可完全离线运行**。
 - 三渲二风格：卡通材质 + 描边轮廓 + 柔和夜景霓虹分层。
-- 文件即网站首页 `index.html`；`.nojekyll` 用于禁用 GitHub Pages 的 Jekyll 处理。
+- 两个 HTML 各自独立：`index.html` 作为 GitHub Pages 首页，`hy4.html` 通过同目录路径访问；`.nojekyll` 用于禁用 GitHub Pages 的 Jekyll 处理。
 
 ## 本地运行
 
-方式一：直接用浏览器打开 `index.html`（双击即可，无需联网）。
+方式一：直接用浏览器打开 `index.html` 或 `hy4.html`（双击即可，无需联网）。
 
 方式二：本地起一个静态服务器后访问，例如：
 
 ```bash
 python -m http.server 8899
 # 浏览器打开 http://127.0.0.1:8899/
+# 或        http://127.0.0.1:8899/hy4.html
 ```
 
 ## 二次开发
 
-1. 修改 `index.html` 中的场景代码；
+1. 修改对应的 `index.html` 或 `hy4.html` 中的场景代码；
 2. 提交并推送：
 
 ```bash
-git add index.html
+git add index.html hy4.html README.md
 git commit -m "update scene"
 git push
 ```
 
-GitHub Pages 会在约 1 分钟后自动重新部署，链接不变。
+GitHub Pages 会在约 1 分钟后自动重新部署，两个预览链接均不变。
 
 ---
 
